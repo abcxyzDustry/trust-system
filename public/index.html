@@ -274,7 +274,8 @@
 
 <script>
 // ── State ─────────────────────────────────────────────
-const API = '';   // same origin
+// Sửa API URL: dùng relative path hoặc full URL nếu cần
+const API = window.location.origin; // hoặc 'http://localhost:3000' nếu chạy khác port
 let page = 1, totalPages = 1;
 let sortField = 'score', sortOrder = 'desc';
 let searchTimer = null;
@@ -291,17 +292,20 @@ document.addEventListener('DOMContentLoaded', () => {
 async function loadStats() {
   try {
     const r = await fetch(`${API}/api/stats`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
-    document.getElementById('s-total').textContent   = d.total;
-    document.getElementById('s-avg').textContent     = d.avgScore + '₫';
-    document.getElementById('s-atrisk').textContent  = d.atRisk;
-    document.getElementById('s-banned').textContent  = d.banned;
-    document.getElementById('s-griefer').textContent = d.griefer;
+    document.getElementById('s-total').textContent   = d.total || 0;
+    document.getElementById('s-avg').textContent     = (d.avgScore || 0) + '₫';
+    document.getElementById('s-atrisk').textContent  = d.atRisk || 0;
+    document.getElementById('s-banned').textContent  = d.banned || 0;
+    document.getElementById('s-griefer').textContent = d.griefer || 0;
     document.getElementById('live-dot').style.background = 'var(--ok)';
     document.getElementById('live-dot').style.boxShadow  = '0 0 6px var(--ok)';
   } catch (e) {
+    console.error('Stats error:', e);
     document.getElementById('live-dot').style.background = 'var(--danger)';
     document.getElementById('live-dot').style.boxShadow  = '0 0 6px var(--danger)';
+    toast('Không thể kết nối đến server!', 'err');
   }
 }
 
@@ -320,23 +324,27 @@ async function loadPlayers(showLoading = true) {
 
   let url = `${API}/api/players?page=${page}&limit=30&sort=${sortField}&order=${sortOrder}`;
   if (search)       url += `&search=${encodeURIComponent(search)}`;
-  if (filterStatus) url += `&filter=${filterStatus}`;  // handled by server if needed
 
   try {
     const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
-    let players = d.players;
+    let players = d.players || [];
 
     // Client-side status filter (simple approach)
     if (filterStatus === 'banned')  players = players.filter(p => p.banned);
     if (filterStatus === 'griefer') players = players.filter(p => p.griefer);
     if (filterStatus === 'atrisk')  players = players.filter(p => p.score < 50 && p.score >= 30);
 
-    totalPages = Math.ceil(d.total / 30) || 1;
+    totalPages = Math.ceil((d.total || 0) / 30) || 1;
     renderTable(players);
-    renderPagination(d.total);
+    renderPagination(d.total || 0);
   } catch (e) {
+    console.error('Load players error:', e);
     toast('Lỗi kết nối backend!', 'err');
+    document.getElementById('tbody').innerHTML = '';
+    document.getElementById('table-empty').style.display = 'block';
+    document.getElementById('table-empty').textContent = '❌ Không thể kết nối đến server. Vui lòng kiểm tra backend!';
   } finally {
     document.getElementById('table-loading').style.display = 'none';
   }
@@ -345,7 +353,7 @@ async function loadPlayers(showLoading = true) {
 function renderTable(players) {
   const tbody = document.getElementById('tbody');
   const empty = document.getElementById('table-empty');
-  if (!players.length) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
+  if (!players.length) { tbody.innerHTML = ''; empty.style.display = 'block'; empty.textContent = 'Không tìm thấy người chơi nào.'; return; }
   empty.style.display = 'none';
 
   tbody.innerHTML = players.map(p => {
@@ -368,8 +376,8 @@ function renderTable(players) {
       <td>
         <div class="score-bar"><div class="score-bar-inner" style="width:${pct}%;background:${bar}"></div></div>
       </td>
-      <td style="color:var(--danger)">${p.kickCount}</td>
-      <td style="color:var(--warn)">${p.voteCount}</td>
+      <td style="color:var(--danger)">${p.kickCount || 0}</td>
+      <td style="color:var(--warn)">${p.voteCount || 0}</td>
       <td>${tags}</td>
       <td style="color:var(--muted);font-size:.78rem">${ago}</td>
       <td class="uuid-cell" title="${p.uuid}">${shortUuid}</td>
@@ -394,7 +402,6 @@ function toggleSort(field) {
   const sel = document.getElementById('filter-sort');
   if (sortField === field) sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
   else { sortField = field; sortOrder = 'desc'; }
-  // Sync with select
   sel.value = `${sortField}-${sortOrder}`;
   ['lastName','score','kickCount','voteCount','lastSeen'].forEach(f => {
     const el = document.getElementById(`arrow-${f}`);
@@ -438,6 +445,7 @@ async function showDetail(uuid) {
 
   try {
     const r = await fetch(`${API}/api/players/${encodeURIComponent(uuid)}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const p = await r.json();
     const sc = scoreClass(p.score);
     const reasons = p.kickReasons?.length
@@ -451,9 +459,9 @@ async function showDetail(uuid) {
       <div class="detail-section">
         <h3>Thống kê</h3>
         <div class="detail-row"><span class="key">Điểm</span><span class="score-badge ${sc}">${p.score}₫</span></div>
-        <div class="detail-row"><span class="key">Bị kick</span><span style="color:var(--danger)">${p.kickCount} lần</span></div>
-        <div class="detail-row"><span class="key">Vote</span><span style="color:var(--warn)">${p.voteCount} lần</span></div>
-        <div class="detail-row"><span class="key">Cộng điểm</span><span style="color:var(--ok)">${p.scoreGainCount} lần</span></div>
+        <div class="detail-row"><span class="key">Bị kick</span><span style="color:var(--danger)">${p.kickCount || 0} lần</span></div>
+        <div class="detail-row"><span class="key">Vote</span><span style="color:var(--warn)">${p.voteCount || 0} lần</span></div>
+        <div class="detail-row"><span class="key">Cộng điểm</span><span style="color:var(--ok)">${p.scoreGainCount || 0} lần</span></div>
         <div class="detail-row"><span class="key">Server</span><span>${escHtml(p.serverName || '—')}</span></div>
         <div class="detail-row"><span class="key">Ngôn ngữ</span><span>${p.lang || 'en'}</span></div>
         <div class="detail-row"><span class="key">Lần cuối</span><span>${relativeTime(p.lastSeen)}</span></div>
@@ -477,6 +485,7 @@ async function showDetail(uuid) {
       </div>
     `;
   } catch (e) {
+    console.error('Detail error:', e);
     content.innerHTML = `<p style="color:var(--danger)">Lỗi tải dữ liệu: ${e.message}</p>`;
   }
 }
@@ -550,9 +559,13 @@ async function api(path, method = 'GET', body) {
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch(`${API}${path}`, opts);
   if (!r.ok) {
-    const e = await r.json().catch(() => ({ error: r.statusText }));
-    toast('❌ ' + (e.error || 'Lỗi'), 'err');
-    throw new Error(e.error);
+    let errorMsg = `HTTP ${r.status}`;
+    try {
+      const e = await r.json();
+      if (e.error) errorMsg = e.error;
+    } catch (e) {}
+    toast('❌ ' + errorMsg, 'err');
+    throw new Error(errorMsg);
   }
   return r.json();
 }
