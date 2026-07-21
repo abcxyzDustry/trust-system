@@ -6,7 +6,6 @@ const path = require('path');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Config ────────────────────────────────────────────
 const PORT        = process.env.PORT        || 3000;
@@ -26,14 +25,11 @@ const playerSchema = new mongoose.Schema({
   kickReasons:    { type: [String], default: [] },
   griefer:        { type: Boolean, default: false },
   banned:         { type: Boolean, default: false },
-  // Extra tracking from plugin v4.0
   grief_break_count: { type: Number, default: 0 },
   is_new_player:     { type: Boolean, default: false },
-  // Admin overrides pending delivery to plugin
   pendingScore:   { type: Number, default: null },
   pendingBan:     { type: Boolean, default: null },
   pendingGriefer: { type: Boolean, default: null },
-  // Meta
   serverName:     { type: String, default: '' },
   lastSeen:       { type: Date, default: Date.now },
   createdAt:      { type: Date, default: Date.now },
@@ -50,23 +46,18 @@ function requireSecret(req, res, next) {
 
 // ─────────────────────────────────────────────────────
 //  POST /api/sync   ← called by Mindustry plugin every 5 min
-//  Body: { action:"sync", secret, server_name, players:[...], team_stats:[...] }
-//  Returns: { ok:true, updates:[{uuid, score?, banned?, griefer?}, ...] }
 // ─────────────────────────────────────────────────────
 app.post('/api/sync', requireSecret, async (req, res) => {
   try {
     const { server_name, players = [], team_stats = [] } = req.body;
-
     const updates = [];
 
     for (const p of players) {
       if (!p.uuid) continue;
 
-      // Find or upsert player record
       let doc = await Player.findOne({ uuid: p.uuid });
 
       if (!doc) {
-        // New player – create from plugin data
         doc = new Player({
           uuid:           p.uuid,
           lastName:       p.name || 'Unknown',
@@ -82,7 +73,6 @@ app.post('/api/sync', requireSecret, async (req, res) => {
         });
         await doc.save();
       } else {
-        // Existing – update from plugin data
         doc.lastName       = p.name || doc.lastName;
         doc.score          = p.score          ?? doc.score;
         doc.kickCount      = p.kick_count     ?? doc.kickCount;
@@ -94,7 +84,6 @@ app.post('/api/sync', requireSecret, async (req, res) => {
         doc.serverName     = server_name || doc.serverName;
         doc.lastSeen       = new Date();
 
-        // Check if there are pending admin overrides to send back to plugin
         const hasPending = doc.pendingScore !== null || doc.pendingBan !== null || doc.pendingGriefer !== null;
         if (hasPending) {
           const entry = { uuid: doc.uuid };
@@ -102,17 +91,13 @@ app.post('/api/sync', requireSecret, async (req, res) => {
           if (doc.pendingBan   !== null)   entry.banned  = doc.pendingBan;
           if (doc.pendingGriefer !== null) entry.griefer = doc.pendingGriefer;
           updates.push(entry);
-
-          // Clear pending flags
           doc.pendingScore   = null;
           doc.pendingBan     = null;
           doc.pendingGriefer = null;
         }
-
         await doc.save();
       }
     }
-
     return res.json({ ok: true, updates, received: players.length });
   } catch (err) {
     console.error('[sync] error:', err.message);
@@ -121,13 +106,13 @@ app.post('/api/sync', requireSecret, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────
-//  Admin REST API  (no auth — as requested)
+//  Admin REST API
 // ─────────────────────────────────────────────────────
 
-// GET /api/players?search=&page=1&limit=50
+// GET /api/players
 app.get('/api/players', async (req, res) => {
   try {
-    const { search = '', page = 1, limit = 50, sort = 'lastName', order = 'asc' } = req.query;
+    const { search = '', page = 1, limit = 30, sort = 'lastName', order = 'asc' } = req.query;
     const q = search
       ? { $or: [
           { lastName:  { $regex: search, $options: 'i' } },
@@ -146,6 +131,7 @@ app.get('/api/players', async (req, res) => {
 
     return res.json({ total, page: Number(page), limit: Number(limit), players });
   } catch (err) {
+    console.error('[api/players] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -157,11 +143,12 @@ app.get('/api/players/:uuid', async (req, res) => {
     if (!doc) return res.status(404).json({ error: 'Not found' });
     return res.json(doc);
   } catch (err) {
+    console.error('[api/players/:uuid] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// PATCH /api/players/:uuid/score   { score: N }
+// PATCH /api/players/:uuid/score
 app.patch('/api/players/:uuid/score', async (req, res) => {
   try {
     const { score } = req.body;
@@ -175,6 +162,7 @@ app.patch('/api/players/:uuid/score', async (req, res) => {
     if (!doc) return res.status(404).json({ error: 'Not found' });
     return res.json({ ok: true, player: doc });
   } catch (err) {
+    console.error('[api/players/:uuid/score] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -190,6 +178,7 @@ app.post('/api/players/:uuid/ban', async (req, res) => {
     if (!doc) return res.status(404).json({ error: 'Not found' });
     return res.json({ ok: true, player: doc });
   } catch (err) {
+    console.error('[api/players/:uuid/ban] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -205,17 +194,17 @@ app.post('/api/players/:uuid/pardon', async (req, res) => {
     if (!doc) return res.status(404).json({ error: 'Not found' });
     return res.json({ ok: true, player: doc });
   } catch (err) {
+    console.error('[api/players/:uuid/pardon] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/players/:uuid/kick  (schedule a kick next sync)
+// POST /api/players/:uuid/kick
 app.post('/api/players/:uuid/kick', async (req, res) => {
   try {
     const { reason = 'Admin kick via dashboard' } = req.body;
     const doc = await Player.findOne({ uuid: req.params.uuid });
     if (!doc) return res.status(404).json({ error: 'Not found' });
-    // Deduct 30 points (KICK_PENALTY) and queue
     const newScore = Math.max(0, doc.score - 30);
     doc.score        = newScore;
     doc.kickCount    = (doc.kickCount || 0) + 1;
@@ -225,11 +214,12 @@ app.post('/api/players/:uuid/kick', async (req, res) => {
     await doc.save();
     return res.json({ ok: true, player: doc });
   } catch (err) {
+    console.error('[api/players/:uuid/kick] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/players/:uuid/griefer  { griefer: true/false }
+// POST /api/players/:uuid/griefer
 app.post('/api/players/:uuid/griefer', async (req, res) => {
   try {
     const griefer = req.body.griefer !== false;
@@ -241,16 +231,18 @@ app.post('/api/players/:uuid/griefer', async (req, res) => {
     if (!doc) return res.status(404).json({ error: 'Not found' });
     return res.json({ ok: true, player: doc });
   } catch (err) {
+    console.error('[api/players/:uuid/griefer] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// DELETE /api/players/:uuid  — full delete
+// DELETE /api/players/:uuid
 app.delete('/api/players/:uuid', async (req, res) => {
   try {
     await Player.deleteOne({ uuid: req.params.uuid });
     return res.json({ ok: true });
   } catch (err) {
+    console.error('[api/players/:uuid/delete] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -268,7 +260,22 @@ app.get('/api/stats', async (req, res) => {
       avgScore: Math.round(avg[0]?.avg ?? 0),
     });
   } catch (err) {
+    console.error('[api/stats] error:', err.message);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Serve static files ───────────────────────────────
+// IMPORTANT: Phải đặt sau API routes để không bị conflict
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Fallback: serve index.html cho tất cả các route không phải API
+app.get('*', (req, res) => {
+  // Chỉ serve index.html nếu không phải route API
+  if (!req.path.startsWith('/api')) {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } else {
+    res.status(404).json({ error: 'API endpoint not found' });
   }
 });
 
