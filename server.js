@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const path = require('path');
 const http = require('http');
+const https = require('https');
 const WebSocket = require('ws');
 
 const app = express();
@@ -15,7 +16,397 @@ const MONGO_URI   = process.env.MONGO_URI   || 'mongodb://localhost:27017/trust_
 const SYNC_SECRET = process.env.SYNC_SECRET || 'crabor-trust-2026';
 const BAN_THRESHOLD = 30;
 
-// ── HTTP + WebSocket Server ───────────────────────────
+// ── Discord Config ────────────────────────────────────
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL ||
+  'https://discord.com/api/webhooks/1529326032522580020/uyCZYHNg0ISWveLt6043JkVVMkhzAiVDdiensUHTPNtF9KZHe4dpu9X-eby7quur-7iU';
+const DISCORD_BOT_TOKEN  = process.env.DISCORD_BOT_TOKEN  || '';
+const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || '';
+
+// ═══════════════════════════════════════════════════════
+//  DISCORD WEBHOOK — gửi notification lên Discord
+// ═══════════════════════════════════════════════════════
+
+function sendDiscordWebhook(title, description, color = 0x00d2ff, fields = []) {
+  try {
+    const embed = {
+      title,
+      description,
+      color,
+      timestamp: new Date().toISOString(),
+      footer: { text: 'TrustSystem Bot' },
+    };
+    if (fields.length > 0) embed.fields = fields;
+
+    const payload = JSON.stringify({ embeds: [embed] });
+    const url = new URL(DISCORD_WEBHOOK_URL);
+
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      if (res.statusCode !== 204 && res.statusCode !== 200) {
+        console.error(`[Discord] webhook responded ${res.statusCode}`);
+      }
+    });
+    req.on('error', (e) => console.error('[Discord] webhook error:', e.message));
+    req.write(payload);
+    req.end();
+  } catch (e) {
+    console.error('[Discord] webhook exception:', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  DISCORD BOT — nhận lệnh điều khiển từ Discord
+// ═══════════════════════════════════════════════════════
+
+let discordBot = null;
+let discordReady = false;
+
+function initDiscordBot() {
+  if (!DISCORD_BOT_TOKEN || DISCORD_BOT_TOKEN.length < 10) {
+    console.log('[Discord] Bot token not set — skipping bot. Webhook notifications still active.');
+    return;
+  }
+
+  try {
+    const { Client, GatewayIntentBits } = require('discord.js');
+
+    discordBot = new Client({
+      intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+      ],
+    });
+
+    discordBot.on('ready', () => {
+      discordReady = true;
+      console.log(`🤖 Discord bot online: ${discordBot.user.tag}`);
+      sendDiscordWebhook(
+        '🟢 Bot Online',
+        `TrustSystem Bot đã kết nối!\nSẵn sàng nhận lệnh: \`!trust <command>\``,
+        0x2ed573
+      );
+    });
+
+    discordBot.on('messageCreate', async (msg) => {
+      // Ignore bots & DMs
+      if (msg.author.bot) return;
+      if (msg.channel.type !== 0) return;
+      // Restrict to specific channel if set
+      if (DISCORD_CHANNEL_ID && msg.channelId !== DISCORD_CHANNEL_ID) return;
+
+      const text = msg.content.trim();
+      if (!text.toLowerCase().startsWith('!trust')) return;
+
+      const parts = text.split(/\s+/);
+      const cmd = (parts[1] || '').toLowerCase();
+      const args = parts.slice(2);
+
+      try {
+        switch (cmd) {
+          case 'help':
+          case 'h': {
+            const helpEmbed = {
+              title: '🤖 TrustSystem — Lệnh Discord',
+              color: 0x00d2ff,
+              fields: [
+                { name: '!trust list [page]', value: 'Danh sách người chơi (mặc định 30/trang)', inline: false },
+                { name: '!trust info <tên hoặc uuid>', value: 'Xem thông tin chi tiết 1 player', inline: false },
+                { name: '!trust score <tên hoặc uuid> <điểm>', value: 'Chỉnh điểm tin nhiệm (0-100)', inline: false },
+                { name: '!trust kick <tên hoặc uuid> [lý do]', value: 'Kick player (−30₫)', inline: false },
+                { name: '!trust ban <tên hoặc uuid>', value: 'Cấm vĩnh viễn (score=0)', inline: false },
+                { name: '!trust pardon <tên hoặc uuid>', value: 'Gỡ cấm (score=30)', inline: false },
+                { name: '!trust griefer <tên hoặc uuid> <on|off>', value: 'Bật/tắt griefer lock', inline: false },
+                { name: '!trust stats', value: 'Thống kê tổng quan', inline: false },
+              ],
+              footer: { text: 'TrustSystem Bot' },
+            };
+            msg.channel.send({ embeds: [helpEmbed] });
+            break;
+          }
+
+          case 'list':
+          case 'ls': {
+            const page = Math.max(1, parseInt(args[0]) || 1);
+            const limit = 20;
+            const total = await Player.countDocuments();
+            const players = await Player.find({})
+              .sort({ score: -1 })
+              .skip((page - 1) * limit)
+              .limit(limit)
+              .lean();
+
+            if (players.length === 0) {
+              msg.reply('📭 Không có player nào.');
+              break;
+            }
+
+            const lines = players.map((p, i) => {
+              const rank = (page - 1) * limit + i + 1;
+              const status = p.banned ? '🔴 BAN' : p.griefer ? '🟡 GRIEF' : p.score < 50 ? '🟠 LOW' : '🟢';
+              return `\`${rank}.\` ${status} **${p.lastName}** — ${p.score}₫ | Kick: ${p.kickCount} | ${p.serverName || '?'}`;
+            });
+
+            msg.channel.send({
+              embeds: [{
+                title: `📋 Danh sách người chơi (Trang ${page}/${Math.ceil(total / limit)})`,
+                description: lines.join('\n'),
+                color: 0x00d2ff,
+                footer: { text: `Tổng: ${total} players` },
+              }],
+            });
+            break;
+          }
+
+          case 'info':
+          case 'i': {
+            if (!args[0]) { msg.reply('❌ Cú pháp: `!trust info <tên hoặc uuid>`'); break; }
+            const query = args.join(' ');
+            const isUuid = query.length > 20 && /^[a-f0-9]/i.test(query);
+            const doc = isUuid
+              ? await Player.findOne({ uuid: { $regex: query, $options: 'i' } }).lean()
+              : await Player.findOne({ lastName: { $regex: query, $options: 'i' } }).lean();
+
+            if (!doc) { msg.reply(`❌ Không tìm thấy: \`${query}\``); break; }
+
+            const status = doc.banned ? '🔴 BANNED' : doc.griefer ? '🟡 GRIEFER' : doc.score < 50 ? '🟠 AT RISK' : '🟢 OK';
+            msg.channel.send({
+              embeds: [{
+                title: `👤 ${doc.lastName}`,
+                color: doc.banned ? 0xff4757 : doc.griefer ? 0xffa502 : 0x2ed573,
+                fields: [
+                  { name: 'UUID', value: `\`${doc.uuid}\``, inline: false },
+                  { name: 'Trust Score', value: `${doc.score}₫`, inline: true },
+                  { name: 'Status', value: status, inline: true },
+                  { name: 'Kick Count', value: String(doc.kickCount), inline: true },
+                  { name: 'Vote Count', value: String(doc.voteCount), inline: true },
+                  { name: 'Griefer', value: doc.griefer ? 'Yes' : 'No', inline: true },
+                  { name: 'Server', value: doc.serverName || 'N/A', inline: true },
+                  { name: 'Last Seen', value: doc.lastSeen ? new Date(doc.lastSeen).toLocaleString('vi-VN') : 'N/A', inline: true },
+                ],
+                footer: { text: 'TrustSystem Bot' },
+              }],
+            });
+            break;
+          }
+
+          case 'score': {
+            if (args.length < 2) { msg.reply('❌ Cú pháp: `!trust score <tên hoặc uuid> <điểm>`'); break; }
+            const scoreVal = parseInt(args[args.length - 1]);
+            const nameQuery = args.slice(0, -1).join(' ');
+            if (isNaN(scoreVal)) { msg.reply('❌ Điểm phải là số (0-100).'); break; }
+            const clamped = Math.max(0, Math.min(100, scoreVal));
+
+            const isUuid = nameQuery.length > 20 && /^[a-f0-9]/i.test(nameQuery);
+            const doc = await Player.findOne(isUuid
+              ? { uuid: { $regex: nameQuery, $options: 'i' } }
+              : { lastName: { $regex: nameQuery, $options: 'i' } }
+            );
+            if (!doc) { msg.reply(`❌ Không tìm thấy: \`${nameQuery}\``); break; }
+
+            const oldScore = doc.score;
+            doc.score = clamped;
+            doc.pendingScore = clamped;
+            if (clamped < BAN_THRESHOLD) { doc.banned = true; doc.pendingBan = true; }
+            await doc.save();
+
+            pushUpdate(doc.uuid, { score: clamped });
+            sendDiscordWebhook(
+              '📝 Điểm đã chỉnh',
+              `Admin **${msg.author.tag}** đã chỉnh điểm`,
+              0x00d2ff,
+              [
+                { name: 'Player', value: doc.lastName, inline: true },
+                { name: 'Cũ → Mới', value: `${oldScore}₫ → ${clamped}₫`, inline: true },
+              ]
+            );
+            msg.reply(`✅ Đã chỉnh điểm **${doc.lastName}**: ${oldScore}₫ → **${clamped}₫**`);
+            break;
+          }
+
+          case 'kick': {
+            if (!args[0]) { msg.reply('❌ Cú pháp: `!trust kick <tên hoặc uuid> [lý do]`'); break; }
+            const reason = args.slice(1).join(' ') || `Kick bởi ${msg.author.tag} qua Discord`;
+            const nameQuery = args[0];
+
+            const isUuid = nameQuery.length > 20 && /^[a-f0-9]/i.test(nameQuery);
+            const doc = await Player.findOne(isUuid
+              ? { uuid: { $regex: nameQuery, $options: 'i' } }
+              : { lastName: { $regex: nameQuery, $options: 'i' } }
+            );
+            if (!doc) { msg.reply(`❌ Không tìm thấy: \`${nameQuery}\``); break; }
+
+            const newScore = Math.max(0, doc.score - 30);
+            doc.score = newScore;
+            doc.kickCount = (doc.kickCount || 0) + 1;
+            doc.kickReasons = [...(doc.kickReasons || []), reason];
+            doc.pendingScore = newScore;
+            doc.pendingBan = newScore < BAN_THRESHOLD;
+            doc.pendingKick = reason;
+            await doc.save();
+
+            pushUpdate(doc.uuid, { score: newScore, kick: true, kickReason: reason });
+            sendDiscordWebhook(
+              '🦶 Player bị kick',
+              `Admin **${msg.author.tag}** đã kick player`,
+              0xffa502,
+              [
+                { name: 'Player', value: doc.lastName, inline: true },
+                { name: 'Lý do', value: reason, inline: true },
+                { name: 'Score', value: `${doc.score}₫`, inline: true },
+              ]
+            );
+            msg.reply(`🦶 Đã kick **${doc.lastName}** — Lý do: ${reason} — Score: ${doc.score}₫`);
+            break;
+          }
+
+          case 'ban': {
+            if (!args[0]) { msg.reply('❌ Cú pháp: `!trust ban <tên hoặc uuid>`'); break; }
+            const nameQuery = args.join(' ');
+
+            const isUuid = nameQuery.length > 20 && /^[a-f0-9]/i.test(nameQuery);
+            const doc = await Player.findOne(isUuid
+              ? { uuid: { $regex: nameQuery, $options: 'i' } }
+              : { lastName: { $regex: nameQuery, $options: 'i' } }
+            );
+            if (!doc) { msg.reply(`❌ Không tìm thấy: \`${nameQuery}\``); break; }
+
+            doc.banned = true;
+            doc.score = 0;
+            doc.pendingBan = true;
+            doc.pendingScore = 0;
+            await doc.save();
+
+            pushUpdate(doc.uuid, { banned: true, score: 0 });
+            sendDiscordWebhook(
+              '🔴 Player bị BAN',
+              `Admin **${msg.author.tag}** đã cấm vĩnh viễn`,
+              0xff4757,
+              [
+                { name: 'Player', value: doc.lastName, inline: true },
+                { name: 'UUID', value: `\`${doc.uuid}\``, inline: false },
+              ]
+            );
+            msg.reply(`🔴 Đã cấm vĩnh viễn **${doc.lastName}** (${doc.uuid})`);
+            break;
+          }
+
+          case 'pardon': {
+            if (!args[0]) { msg.reply('❌ Cú pháp: `!trust pardon <tên hoặc uuid>`'); break; }
+            const nameQuery = args.join(' ');
+
+            const isUuid = nameQuery.length > 20 && /^[a-f0-9]/i.test(nameQuery);
+            const doc = await Player.findOne(isUuid
+              ? { uuid: { $regex: nameQuery, $options: 'i' } }
+              : { lastName: { $regex: nameQuery, $options: 'i' } }
+            );
+            if (!doc) { msg.reply(`❌ Không tìm thấy: \`${nameQuery}\``); break; }
+
+            doc.banned = false;
+            doc.griefer = false;
+            doc.score = BAN_THRESHOLD;
+            doc.pendingBan = false;
+            doc.pendingGriefer = false;
+            doc.pendingScore = BAN_THRESHOLD;
+            await doc.save();
+
+            pushUpdate(doc.uuid, { banned: false, griefer: false, score: BAN_THRESHOLD });
+            sendDiscordWebhook(
+              '🟢 Player được pardon',
+              `Admin **${msg.author.tag}** đã gỡ cấm`,
+              0x2ed573,
+              [
+                { name: 'Player', value: doc.lastName, inline: true },
+                { name: 'Score', value: `${BAN_THRESHOLD}₫`, inline: true },
+              ]
+            );
+            msg.reply(`🟢 Đã gỡ cấm **${doc.lastName}** — Score: ${BAN_THRESHOLD}₫`);
+            break;
+          }
+
+          case 'griefer': {
+            if (args.length < 2) { msg.reply('❌ Cú pháp: `!trust griefer <tên hoặc uuid> <on|off>`'); break; }
+            const state = args[args.length - 1].toLowerCase();
+            const nameQuery = args.slice(0, -1).join(' ');
+            if (state !== 'on' && state !== 'off') { msg.reply('❌ Giá trị phải là `on` hoặc `off`.'); break; }
+            const griefer = state === 'on';
+
+            const isUuid = nameQuery.length > 20 && /^[a-f0-9]/i.test(nameQuery);
+            const doc = await Player.findOne(isUuid
+              ? { uuid: { $regex: nameQuery, $options: 'i' } }
+              : { lastName: { $regex: nameQuery, $options: 'i' } }
+            );
+            if (!doc) { msg.reply(`❌ Không tìm thấy: \`${nameQuery}\``); break; }
+
+            doc.griefer = griefer;
+            doc.pendingGriefer = griefer;
+            await doc.save();
+
+            pushUpdate(doc.uuid, { griefer });
+            sendDiscordWebhook(
+              griefer ? '🟡 Griefer Lock ON' : '🟢 Griefer Lock OFF',
+              `Admin **${msg.author.tag}** ${griefer ? 'bật' : 'tắt'} griefer lock`,
+              griefer ? 0xffa502 : 0x2ed573,
+              [{ name: 'Player', value: doc.lastName, inline: true }]
+            );
+            msg.reply(`${griefer ? '🟡 Bật' : '🟢 Tắt'} griefer lock cho **${doc.lastName}**`);
+            break;
+          }
+
+          case 'stats': {
+            const total = await Player.countDocuments();
+            const banned = await Player.countDocuments({ banned: true });
+            const griefer = await Player.countDocuments({ griefer: true });
+            const atRisk = await Player.countDocuments({ score: { $lt: 50, $gte: BAN_THRESHOLD } });
+            const avgAgg = await Player.aggregate([{ $group: { _id: null, avg: { $avg: '$score' } } }]);
+            const avgScore = Math.round(avgAgg[0]?.avg ?? 0);
+
+            msg.channel.send({
+              embeds: [{
+                title: '📊 Thống kê TrustSystem',
+                color: 0x00d2ff,
+                fields: [
+                  { name: 'Tổng Players', value: String(total), inline: true },
+                  { name: 'Banned', value: String(banned), inline: true },
+                  { name: 'Griefers', value: String(griefer), inline: true },
+                  { name: 'At Risk (<50₫)', value: String(atRisk), inline: true },
+                  { name: 'Avg Score', value: `${avgScore}₫`, inline: true },
+                  { name: 'Servers Online', value: String(connectedServers.size), inline: true },
+                ],
+                footer: { text: 'TrustSystem Bot' },
+              }],
+            });
+            break;
+          }
+
+          default:
+            msg.reply('❓ Lệnh không hợp lệ. Gõ `!trust help` để xem danh sách lệnh.');
+        }
+      } catch (cmdErr) {
+        console.error('[Discord] command error:', cmdErr.message);
+        msg.reply('❌ Lỗi: ' + cmdErr.message);
+      }
+    });
+
+    discordBot.login(DISCORD_BOT_TOKEN);
+  } catch (e) {
+    console.error('[Discord] Bot init failed (discord.js not installed?):', e.message);
+    console.log('[Discord] Webhook notifications still active. Bot commands need "discord.js" package.');
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  HTTP + WebSocket Server
+// ═══════════════════════════════════════════════════════
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
@@ -98,7 +489,7 @@ const playerSchema = new mongoose.Schema({
   pendingScore:   { type: Number, default: null },
   pendingBan:     { type: Boolean, default: null },
   pendingGriefer: { type: Boolean, default: null },
-  pendingKick:    { type: String, default: null },  // NEW: stores kick reason
+  pendingKick:    { type: String, default: null },
   serverName:     { type: String, default: '' },
   lastSeen:       { type: Date, default: Date.now },
   createdAt:      { type: Date, default: Date.now },
@@ -118,13 +509,13 @@ function requireSecret(req, res, next) {
 // ═══════════════════════════════════════════════════════
 
 // POST /api/sync/join  ← plugin gọi khi player JOIN server
-//    Trả về toàn bộ data backend cho plugin apply trong game
 app.post('/api/sync/join', requireSecret, async (req, res) => {
   try {
     const { uuid, name, server_name } = req.body;
     if (!uuid) return res.status(400).json({ error: 'uuid required' });
 
     let doc = await Player.findOne({ uuid });
+    const isNew = !doc;
     if (!doc) {
       doc = new Player({
         uuid,
@@ -134,12 +525,38 @@ app.post('/api/sync/join', requireSecret, async (req, res) => {
       });
       await doc.save();
       console.log(`🆕 New player: ${name} (${uuid})`);
+
+      // ── Discord notification: player mới ──
+      sendDiscordWebhook(
+        '🆕 Player mới tham gia',
+        `Người chơi mới đã được sync vào backend`,
+        0x2ed573,
+        [
+          { name: 'Tên', value: name || 'Unknown', inline: true },
+          { name: 'Score', value: '100₫', inline: true },
+          { name: 'Server', value: server_name || 'Unknown', inline: true },
+          { name: 'UUID', value: `\`${uuid}\``, inline: false },
+        ]
+      );
     } else {
       doc.lastName   = name || doc.lastName;
       doc.serverName  = server_name || doc.serverName;
       doc.lastSeen    = new Date();
       await doc.save();
       console.log(`👋 Player joined: ${name} (${uuid})`);
+
+      // ── Discord notification: player quay lại ──
+      sendDiscordWebhook(
+        '👋 Player join server',
+        `${name || 'Unknown'} đã vào server`,
+        0x00d2ff,
+        [
+          { name: 'Tên', value: name || 'Unknown', inline: true },
+          { name: 'Score', value: `${doc.score}₫`, inline: true },
+          { name: 'Banned', value: doc.banned ? 'YES' : 'No', inline: true },
+          { name: 'Server', value: server_name || 'Unknown', inline: true },
+        ]
+      );
     }
 
     return res.json({
@@ -162,7 +579,6 @@ app.post('/api/sync/join', requireSecret, async (req, res) => {
 });
 
 // POST /api/sync/leave  ← plugin gọi khi player LEAVE server
-//    Plugin gửi toàn bộ data hiện tại → backend lưu
 app.post('/api/sync/leave', requireSecret, async (req, res) => {
   try {
     const {
@@ -179,6 +595,7 @@ app.post('/api/sync/leave', requireSecret, async (req, res) => {
       console.log(`🆕 New player (on leave): ${name} (${uuid})`);
     }
 
+    const oldScore = doc.score;
     doc.lastName  = name || doc.lastName;
     if (score             !== undefined) doc.score             = score;
     if (kick_count        !== undefined) doc.kickCount        = kick_count;
@@ -198,6 +615,30 @@ app.post('/api/sync/leave', requireSecret, async (req, res) => {
 
     await doc.save();
     console.log(`📤 Player left & synced: ${name} (${uuid})`);
+
+    // ── Discord notification: player leave ──
+    if (oldScore !== doc.score) {
+      sendDiscordWebhook(
+        '📤 Player leave & sync',
+        `${name || 'Unknown'} đã rời server`,
+        0xa29bfe,
+        [
+          { name: 'Tên', value: name || 'Unknown', inline: true },
+          { name: 'Score', value: `${oldScore}₫ → ${doc.score}₫`, inline: true },
+          { name: 'Server', value: server_name || 'Unknown', inline: true },
+        ]
+      );
+    } else {
+      sendDiscordWebhook(
+        '📤 Player leave',
+        `${name || 'Unknown'} đã rời server — Score: ${doc.score}₫`,
+        0xa29bfe,
+        [
+          { name: 'Server', value: server_name || 'Unknown', inline: true },
+        ]
+      );
+    }
+
     return res.json({ ok: true });
   } catch (err) {
     console.error('[sync/leave] error:', err.message);
@@ -205,8 +646,7 @@ app.post('/api/sync/leave', requireSecret, async (req, res) => {
   }
 });
 
-// GET /api/pending-updates ← plugin poll mỗi 2 giây để nhận update tức thì
-//    Trả về tất cả pending changes và clear chúng
+// GET /api/pending-updates ← plugin poll mỗi 2 giây
 app.get('/api/pending-updates', requireSecret, async (req, res) => {
   try {
     const players = await Player.find({
@@ -227,7 +667,6 @@ app.get('/api/pending-updates', requireSecret, async (req, res) => {
       return entry;
     });
 
-    // Clear pending fields
     if (players.length > 0) {
       await Player.updateMany(
         { _id: { $in: players.map(p => p._id) } },
@@ -242,7 +681,7 @@ app.get('/api/pending-updates', requireSecret, async (req, res) => {
   }
 });
 
-// POST /api/sync  ← (giữ lại cho backward compat — periodic sync cũ)
+// POST /api/sync  ← (backward compat — periodic sync cũ)
 app.post('/api/sync', requireSecret, async (req, res) => {
   try {
     const { server_name, players = [], team_stats = [] } = req.body;
@@ -250,48 +689,36 @@ app.post('/api/sync', requireSecret, async (req, res) => {
 
     for (const p of players) {
       if (!p.uuid) continue;
-
       let doc = await Player.findOne({ uuid: p.uuid });
 
       if (!doc) {
         doc = new Player({
-          uuid:           p.uuid,
-          lastName:       p.name || 'Unknown',
-          score:          p.score ?? 100,
-          kickCount:      p.kick_count ?? 0,
-          voteCount:      p.vote_count ?? 0,
-          griefer:        p.griefer ?? false,
-          banned:         p.banned  ?? false,
-          grief_break_count: p.grief_break_count ?? 0,
-          is_new_player:     p.is_new_player     ?? false,
-          serverName:     server_name || '',
-          lastSeen:       new Date(),
+          uuid: p.uuid, lastName: p.name || 'Unknown',
+          score: p.score ?? 100, kickCount: p.kick_count ?? 0,
+          voteCount: p.vote_count ?? 0, griefer: p.griefer ?? false,
+          banned: p.banned ?? false, serverName: server_name || '',
+          lastSeen: new Date(),
         });
         await doc.save();
       } else {
-        doc.lastName       = p.name || doc.lastName;
-        doc.score          = p.score          ?? doc.score;
-        doc.kickCount      = p.kick_count     ?? doc.kickCount;
-        doc.voteCount      = p.vote_count     ?? doc.voteCount;
-        doc.griefer        = p.griefer        ?? doc.griefer;
-        doc.banned         = p.banned         ?? doc.banned;
-        doc.grief_break_count = p.grief_break_count ?? doc.grief_break_count;
-        doc.is_new_player  = p.is_new_player  ?? doc.is_new_player;
-        doc.serverName     = server_name || doc.serverName;
-        doc.lastSeen       = new Date();
+        doc.lastName = p.name || doc.lastName;
+        doc.score = p.score ?? doc.score;
+        doc.kickCount = p.kick_count ?? doc.kickCount;
+        doc.voteCount = p.vote_count ?? doc.voteCount;
+        doc.griefer = p.griefer ?? doc.griefer;
+        doc.banned = p.banned ?? doc.banned;
+        doc.serverName = server_name || doc.serverName;
+        doc.lastSeen = new Date();
 
         const hasPending = doc.pendingScore !== null || doc.pendingBan !== null || doc.pendingGriefer !== null || doc.pendingKick !== null;
         if (hasPending) {
           const entry = { uuid: doc.uuid };
-          if (doc.pendingScore   !== null) entry.score      = doc.pendingScore;
-          if (doc.pendingBan     !== null) entry.banned     = doc.pendingBan;
-          if (doc.pendingGriefer !== null) entry.griefer    = doc.pendingGriefer;
-          if (doc.pendingKick    !== null) entry.kickReason = doc.pendingKick;
+          if (doc.pendingScore !== null) entry.score = doc.pendingScore;
+          if (doc.pendingBan !== null) entry.banned = doc.pendingBan;
+          if (doc.pendingGriefer !== null) entry.griefer = doc.pendingGriefer;
+          if (doc.pendingKick !== null) entry.kickReason = doc.pendingKick;
           updates.push(entry);
-          doc.pendingScore   = null;
-          doc.pendingBan     = null;
-          doc.pendingGriefer = null;
-          doc.pendingKick    = null;
+          doc.pendingScore = null; doc.pendingBan = null; doc.pendingGriefer = null; doc.pendingKick = null;
         }
         await doc.save();
       }
@@ -307,34 +734,23 @@ app.post('/api/sync', requireSecret, async (req, res) => {
 //  Admin REST API
 // ═══════════════════════════════════════════════════════
 
-// GET /api/players
 app.get('/api/players', async (req, res) => {
   try {
     const { search = '', page = 1, limit = 30, sort = 'lastName', order = 'asc' } = req.query;
-    const q = search
-      ? { $or: [
-          { lastName:  { $regex: search, $options: 'i' } },
-          { uuid:      { $regex: search, $options: 'i' } },
-          { serverName:{ $regex: search, $options: 'i' } },
-        ] }
-      : {};
-
+    const q = search ? { $or: [
+      { lastName: { $regex: search, $options: 'i' } },
+      { uuid: { $regex: search, $options: 'i' } },
+      { serverName: { $regex: search, $options: 'i' } },
+    ] } : {};
     const sortObj = { [sort]: order === 'desc' ? -1 : 1 };
-    const total   = await Player.countDocuments(q);
-    const players = await Player.find(q)
-      .sort(sortObj)
-      .skip((page - 1) * limit)
-      .limit(Number(limit))
-      .lean();
-
+    const total = await Player.countDocuments(q);
+    const players = await Player.find(q).sort(sortObj).skip((page - 1) * limit).limit(Number(limit)).lean();
     return res.json({ total, page: Number(page), limit: Number(limit), players });
   } catch (err) {
-    console.error('[api/players] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/players/:id (supports both _id and uuid)
 app.get('/api/players/:id', async (req, res) => {
   try {
     const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
@@ -344,25 +760,18 @@ app.get('/api/players/:id', async (req, res) => {
     if (!doc) return res.status(404).json({ error: 'Not found' });
     return res.json(doc);
   } catch (err) {
-    console.error('[api/players/:id] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/connections — list game servers đang kết nối WebSocket
 app.get('/api/connections', (req, res) => {
   const servers = [];
   for (const [ws, info] of connectedServers) {
-    servers.push({
-      serverName: info.serverName,
-      connected: ws.readyState === WebSocket.OPEN,
-      lastPing: info.lastPing,
-    });
+    servers.push({ serverName: info.serverName, connected: ws.readyState === WebSocket.OPEN, lastPing: info.lastPing });
   }
   return res.json({ servers, count: servers.length });
 });
 
-// PATCH /api/players/:id/score
 app.patch('/api/players/:id/score', async (req, res) => {
   try {
     const { score } = req.body;
@@ -370,66 +779,44 @@ app.patch('/api/players/:id/score', async (req, res) => {
     const clamped = Math.max(0, Math.min(100, Number(score)));
     const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
     const q = isObjId ? { _id: req.params.id } : { uuid: req.params.id };
-    const doc = await Player.findOneAndUpdate(
-      q,
-      { $set: { score: clamped, pendingScore: clamped } },
-      { new: true }
-    );
+    const doc = await Player.findOneAndUpdate(q, { $set: { score: clamped, pendingScore: clamped } }, { new: true });
     if (!doc) return res.status(404).json({ error: 'Not found' });
-
-    // ⚡ PUSH TỨC THÌ
     pushUpdate(doc.uuid, { score: clamped });
-
+    sendDiscordWebhook('📝 Score changed (Web)', `**${doc.lastName}** → ${clamped}₫`, 0x00d2ff);
     return res.json({ ok: true, player: doc });
   } catch (err) {
-    console.error('[api/players/:id/score] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/players/:id/ban
 app.post('/api/players/:id/ban', async (req, res) => {
   try {
     const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
     const q = isObjId ? { _id: req.params.id } : { uuid: req.params.id };
-    const doc = await Player.findOneAndUpdate(
-      q,
-      { $set: { banned: true, score: 0, pendingBan: true, pendingScore: 0 } },
-      { new: true }
-    );
+    const doc = await Player.findOneAndUpdate(q, { $set: { banned: true, score: 0, pendingBan: true, pendingScore: 0 } }, { new: true });
     if (!doc) return res.status(404).json({ error: 'Not found' });
-
     pushUpdate(doc.uuid, { banned: true, score: 0 });
-
+    sendDiscordWebhook('🔴 BAN (Web)', `**${doc.lastName}** đã bị cấm qua Web Dashboard`, 0xff4757);
     return res.json({ ok: true, player: doc });
   } catch (err) {
-    console.error('[api/players/:id/ban] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/players/:id/pardon
 app.post('/api/players/:id/pardon', async (req, res) => {
   try {
     const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
     const q = isObjId ? { _id: req.params.id } : { uuid: req.params.id };
-    const doc = await Player.findOneAndUpdate(
-      q,
-      { $set: { banned: false, griefer: false, score: BAN_THRESHOLD, pendingBan: false, pendingGriefer: false, pendingScore: BAN_THRESHOLD } },
-      { new: true }
-    );
+    const doc = await Player.findOneAndUpdate(q, { $set: { banned: false, griefer: false, score: BAN_THRESHOLD, pendingBan: false, pendingGriefer: false, pendingScore: BAN_THRESHOLD } }, { new: true });
     if (!doc) return res.status(404).json({ error: 'Not found' });
-
     pushUpdate(doc.uuid, { banned: false, griefer: false, score: BAN_THRESHOLD });
-
+    sendDiscordWebhook('🟢 Pardon (Web)', `**${doc.lastName}** đã được gỡ cấm qua Web Dashboard`, 0x2ed573);
     return res.json({ ok: true, player: doc });
   } catch (err) {
-    console.error('[api/players/:id/pardon] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/players/:id/kick
 app.post('/api/players/:id/kick', async (req, res) => {
   try {
     const { reason = 'Admin kick via dashboard' } = req.body;
@@ -438,46 +825,36 @@ app.post('/api/players/:id/kick', async (req, res) => {
     const doc = await Player.findOne(q);
     if (!doc) return res.status(404).json({ error: 'Not found' });
     const newScore = Math.max(0, doc.score - 30);
-    doc.score        = newScore;
-    doc.kickCount    = (doc.kickCount || 0) + 1;
-    doc.kickReasons  = [...(doc.kickReasons || []), reason];
+    doc.score = newScore;
+    doc.kickCount = (doc.kickCount || 0) + 1;
+    doc.kickReasons = [...(doc.kickReasons || []), reason];
     doc.pendingScore = newScore;
-    doc.pendingBan   = newScore < BAN_THRESHOLD;
-    doc.pendingKick  = reason;  // NEW: plugin sẽ kick player
+    doc.pendingBan = newScore < BAN_THRESHOLD;
+    doc.pendingKick = reason;
     await doc.save();
-
     pushUpdate(doc.uuid, { score: newScore, kick: true, kickReason: reason, ban: newScore < BAN_THRESHOLD });
-
+    sendDiscordWebhook('🦶 Kick (Web)', `**${doc.lastName}** bị kick — Lý do: ${reason} — Score: ${newScore}₫`, 0xffa502);
     return res.json({ ok: true, player: doc });
   } catch (err) {
-    console.error('[api/players/:id/kick] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/players/:id/griefer
 app.post('/api/players/:id/griefer', async (req, res) => {
   try {
     const griefer = req.body.griefer !== false;
     const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
     const q = isObjId ? { _id: req.params.id } : { uuid: req.params.id };
-    const doc = await Player.findOneAndUpdate(
-      q,
-      { $set: { griefer, pendingGriefer: griefer } },
-      { new: true }
-    );
+    const doc = await Player.findOneAndUpdate(q, { $set: { griefer, pendingGriefer: griefer } }, { new: true });
     if (!doc) return res.status(404).json({ error: 'Not found' });
-
     pushUpdate(doc.uuid, { griefer });
-
+    sendDiscordWebhook(griefer ? '🟡 Griefer ON (Web)' : '🟢 Griefer OFF (Web)', `**${doc.lastName}** — griefer ${griefer ? 'ON' : 'OFF'}`, griefer ? 0xffa502 : 0x2ed573);
     return res.json({ ok: true, player: doc });
   } catch (err) {
-    console.error('[api/players/:id/griefer] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// DELETE /api/players/:id
 app.delete('/api/players/:id', async (req, res) => {
   try {
     const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
@@ -485,26 +862,24 @@ app.delete('/api/players/:id', async (req, res) => {
     await Player.deleteOne(q);
     return res.json({ ok: true });
   } catch (err) {
-    console.error('[api/players/:id/delete] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/stats
 app.get('/api/stats', async (req, res) => {
   try {
-    const total   = await Player.countDocuments();
-    const banned  = await Player.countDocuments({ banned: true });
+    const total = await Player.countDocuments();
+    const banned = await Player.countDocuments({ banned: true });
     const griefer = await Player.countDocuments({ griefer: true });
-    const atRisk  = await Player.countDocuments({ score: { $lt: 50, $gte: BAN_THRESHOLD } });
-    const avg     = await Player.aggregate([{ $group: { _id: null, avg: { $avg: '$score' } } }]);
+    const atRisk = await Player.countDocuments({ score: { $lt: 50, $gte: BAN_THRESHOLD } });
+    const avg = await Player.aggregate([{ $group: { _id: null, avg: { $avg: '$score' } } }]);
     return res.json({
       total, banned, griefer, atRisk,
       avgScore: Math.round(avg[0]?.avg ?? 0),
       connectedServers: connectedServers.size,
+      discordBot: discordReady,
     });
   } catch (err) {
-    console.error('[api/stats] error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -512,7 +887,6 @@ app.get('/api/stats', async (req, res) => {
 // ── Serve static files ───────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Fallback: serve index.html cho tất cả route không phải API
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -525,7 +899,11 @@ app.get('*', (req, res) => {
 mongoose.connect(MONGO_URI)
   .then(() => {
     console.log('✅ MongoDB connected:', MONGO_URI);
-    server.listen(PORT, () => console.log(`🚀 Trust Backend running on http://localhost:${PORT}`));
+    server.listen(PORT, () => {
+      console.log(`🚀 Trust Backend running on http://localhost:${PORT}`);
+      console.log(`📢 Discord webhook: ${DISCORD_WEBHOOK_URL ? 'configured' : 'not set'}`);
+      initDiscordBot();
+    });
   })
   .catch(err => {
     console.error('❌ MongoDB connection failed:', err.message);
