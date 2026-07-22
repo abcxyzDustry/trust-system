@@ -21,7 +21,11 @@
   .header span{font-size:.8rem;color:var(--muted)}
   .header .live-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);
     box-shadow:0 0 6px var(--ok);margin-left:auto}
-  
+  .header .ws-status{font-size:.75rem;color:var(--muted);display:flex;align-items:center;gap:5px}
+  .header .ws-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);transition:.2s}
+  .header .ws-dot.connected{background:var(--ok);box-shadow:0 0 5px var(--ok)}
+  .header .ws-dot.disconnected{background:var(--danger)}
+
   .main{max-width:1400px;margin:0 auto;padding:20px 16px}
 
   /* ─── Stats bar ─── */
@@ -164,6 +168,10 @@
   </svg>
   <h1>TrustSystem Admin</h1>
   <span id="server-name" style="color:var(--muted)">Loading...</span>
+  <div class="ws-status">
+    <div class="ws-dot" id="ws-dot"></div>
+    <span id="ws-text">WS: —</span>
+  </div>
   <div class="live-dot" id="live-dot" title="Connected"></div>
 </div>
 
@@ -261,7 +269,7 @@
     <p style="color:var(--muted);font-size:.85rem">Người chơi: <span id="kick-name" style="color:var(--text)"></span></p>
     <label>Lý do kick</label>
     <input type="text" id="kick-reason" placeholder="Lý do…"/>
-    <p style="color:var(--warn);font-size:.78rem;margin-top:8px">⚠ Sẽ trừ 30₫ và kick khi plugin sync tiếp theo.</p>
+    <p style="color:var(--warn);font-size:.78rem;margin-top:8px">⚠ Sẽ trừ 30₫ và kick ngay lập tức.</p>
     <div class="modal-btns">
       <button onclick="closeKickModal()">Hủy</button>
       <button class="danger" onclick="submitKick()">Kick</button>
@@ -274,19 +282,72 @@
 
 <script>
 // ── State ─────────────────────────────────────────────
-// Sửa API URL: dùng relative path hoặc full URL nếu cần
 const API = 'https://trust-system-jplx.onrender.com';
 let page = 1, totalPages = 1;
 let sortField = 'score', sortOrder = 'desc';
 let searchTimer = null;
 let currentModalUuid = null;
+let ws = null;
 
 // ── Init ──────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   loadStats();
   loadPlayers();
-  setInterval(() => { loadStats(); loadPlayers(false); }, 30000); // auto-refresh 30s
+  setInterval(() => { loadStats(); loadPlayers(false); }, 30000);
+  connectWS();
 });
+
+// ── WebSocket — nhận update tức thì từ backend ────────
+function connectWS() {
+  const wsUrl = API.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws';
+  try {
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      updateWSStatus(true);
+      ws.send(JSON.stringify({ type: 'register', serverName: 'admin-dashboard' }));
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong' }));
+        } else if (data.type === 'player_update') {
+          // Có update mới → reload ngay
+          loadPlayers(false);
+          loadStats();
+          toast('⚡ Update tức thì: ' + (data.uuid?.substring(0, 8) || ''), 'ok');
+        }
+      } catch (e) {}
+    };
+
+    ws.onclose = () => {
+      updateWSStatus(false);
+      // Reconnect sau 3s
+      setTimeout(connectWS, 3000);
+    };
+
+    ws.onerror = () => {
+      updateWSStatus(false);
+    };
+  } catch (e) {
+    console.error('WS error:', e);
+    updateWSStatus(false);
+  }
+}
+
+function updateWSStatus(connected) {
+  const dot = document.getElementById('ws-dot');
+  const text = document.getElementById('ws-text');
+  if (connected) {
+    dot.className = 'ws-dot connected';
+    text.textContent = 'WS: Live';
+  } else {
+    dot.className = 'ws-dot disconnected';
+    text.textContent = 'WS: Off';
+  }
+}
 
 // ── Stats ─────────────────────────────────────────────
 async function loadStats() {
@@ -331,7 +392,7 @@ async function loadPlayers(showLoading = true) {
     const d = await r.json();
     let players = d.players || [];
 
-    // Client-side status filter (simple approach)
+    // Client-side status filter
     if (filterStatus === 'banned')  players = players.filter(p => p.banned);
     if (filterStatus === 'griefer') players = players.filter(p => p.griefer);
     if (filterStatus === 'atrisk')  players = players.filter(p => p.score < 50 && p.score >= 30);
@@ -425,76 +486,64 @@ function renderPagination(total) {
   html += `<button onclick="gotoPage(${page-1})" ${page<=1?'disabled':''}>‹</button>`;
 
   const start = Math.max(1, page - 2), end = Math.min(tp, page + 2);
-  for (let i = start; i <= end; i++)
+  for (let i = start; i <= end; i++) {
     html += `<button class="${i===page?'primary':''}" onclick="gotoPage(${i})">${i}</button>`;
+  }
 
   html += `<button onclick="gotoPage(${page+1})" ${page>=tp?'disabled':''}>›</button>`;
   html += `<button onclick="gotoPage(${tp})" ${page>=tp?'disabled':''}>»</button>`;
-  html += `<span class="page-info">Trang ${page}/${tp} (${total} người)</span>`;
+  html += `<span class="page-info">${page}/${tp} (${total})</span>`;
   pg.innerHTML = html;
 }
+function gotoPage(p) { page = p; loadPlayers(); }
 
-function gotoPage(p2) { page = p2; loadPlayers(); }
-
-// ── Detail panel ──────────────────────────────────────
-async function showDetail(uuid) {
-  const panel = document.getElementById('detail-panel');
-  const content = document.getElementById('detail-content');
-  panel.classList.add('open');
-  content.innerHTML = '<div class="center"><div class="loader"></div></div>';
-
+// ── Detail panel ───────────────────────────────────────
+async function showDetail(id) {
   try {
-    const r = await fetch(`${API}/api/players/${uuid}`); // uuid here is actually _id
+    const r = await fetch(`${API}/api/players/${id}`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const p = await r.json();
-    const sc = scoreClass(p.score);
-    const reasons = p.kickReasons?.length
-      ? p.kickReasons.slice(-10).reverse().map(r2 => `<li>${escHtml(r2)}</li>`).join('')
-      : '<li style="color:var(--ok)">Chưa có lý do nào ✅</li>';
+
+    const panel = document.getElementById('detail-panel');
+    const content = document.getElementById('detail-content');
+
+    let reasonsHtml = (p.kickReasons && p.kickReasons.length)
+      ? `<div class="reasons-list"><ul>${p.kickReasons.map(r => `<li>${escHtml(r)}</li>`).join('')}</ul></div>`
+      : '<p style="color:var(--muted);font-size:.85rem">Không có</p>';
 
     content.innerHTML = `
-      <h2 style="color:var(--accent);margin-bottom:6px">${escHtml(p.lastName)}</h2>
-      <p style="font-size:.75rem;color:var(--muted);font-family:monospace">${p.uuid}</p>
-      ${statusTags(p)}
+      <h2 style="color:var(--accent);font-size:1.1rem;margin-bottom:4px">${escHtml(p.lastName)}</h2>
       <div class="detail-section">
-        <h3>Thống kê</h3>
-        <div class="detail-row"><span class="key">Điểm</span><span class="score-badge ${sc}">${p.score}₫</span></div>
-        <div class="detail-row"><span class="key">Bị kick</span><span style="color:var(--danger)">${p.kickCount || 0} lần</span></div>
-        <div class="detail-row"><span class="key">Vote</span><span style="color:var(--warn)">${p.voteCount || 0} lần</span></div>
-        <div class="detail-row"><span class="key">Cộng điểm</span><span style="color:var(--ok)">${p.scoreGainCount || 0} lần</span></div>
-        <div class="detail-row"><span class="key">Server</span><span>${escHtml(p.serverName || '—')}</span></div>
-        <div class="detail-row"><span class="key">Ngôn ngữ</span><span>${p.lang || 'en'}</span></div>
+        <div class="detail-row"><span class="key">UUID</span><span style="font-family:monospace;font-size:.78rem">${p.uuid || '—'}</span></div>
+        <div class="detail-row"><span class="key">Điểm</span><span class="score-badge ${scoreClass(p.score)}">${p.score}₫</span></div>
+        <div class="detail-row"><span class="key">Bị cấm</span><span style="color:${p.banned?'var(--danger)':'var(--ok)'}">${p.banned?'⛔ Có':'✅ Không'}</span></div>
+        <div class="detail-row"><span class="key">Griefer</span><span style="color:${p.griefer?'var(--purple)':'var(--ok)'}">${p.griefer?'🚨 Có':'✅ Không'}</span></div>
+        <div class="detail-row"><span class="key">Server</span><span>${escHtml(p.serverName) || '—'}</span></div>
         <div class="detail-row"><span class="key">Lần cuối</span><span>${relativeTime(p.lastSeen)}</span></div>
       </div>
       <div class="detail-section">
-        <h3>Lý do bị kick (mới nhất)</h3>
-        <ul class="reasons-list">${reasons}</ul>
+        <h3>Thống kê</h3>
+        <div class="detail-row"><span class="key">Bị kick</span><span style="color:var(--danger)">${p.kickCount || 0}</span></div>
+        <div class="detail-row"><span class="key">Bị vote</span><span style="color:var(--warn)">${p.voteCount || 0}</span></div>
+        <div class="detail-row"><span class="key">Grief break</span><span>${p.grief_break_count || 0}</span></div>
+        <div class="detail-row"><span class="key">Player mới</span><span>${p.is_new_player?'✅ Có':'❌ Không'}</span></div>
       </div>
-      <div class="detail-section" style="margin-top:16px">
-        <h3>Hành động nhanh</h3>
-        <div class="actions" style="flex-direction:column;gap:8px">
-          <button onclick="openScoreModal('${p._id}','${escHtml(p.lastName)}',${p.score})">✏️ Điều chỉnh điểm</button>
-          <button class="warn" onclick="openKickModal('${p._id}','${escHtml(p.lastName)}')" >🦶 Kick</button>
-          ${p.banned
-            ? `<button class="ok" onclick="pardon('${p._id}');closeDetail()">✅ Tha lỗi (unban)</button>`
-            : `<button class="danger" onclick="ban('${p._id}');closeDetail()">⛔ Cấm vĩnh viễn</button>`}
-          ${p.griefer
-            ? `<button onclick="setGriefer('${p._id}',false);closeDetail()">🔓 Hủy nhãn Griefer</button>`
-            : `<button style="color:var(--purple)" onclick="setGriefer('${p._id}',true);closeDetail()">🚨 Đánh dấu Griefer</button>`}
-        </div>
+      <div class="detail-section">
+        <h3>Lý do kick</h3>
+        ${reasonsHtml}
       </div>
     `;
+    panel.classList.add('open');
   } catch (e) {
     console.error('Detail error:', e);
-    content.innerHTML = `<p style="color:var(--danger)">Lỗi tải dữ liệu: ${e.message}</p>`;
+    toast('Không tải được chi tiết!', 'err');
   }
 }
-
 function closeDetail() {
   document.getElementById('detail-panel').classList.remove('open');
 }
 
-// ── Score modal ───────────────────────────────────────
+// ── Score modal ────────────────────────────────────────
 function openScoreModal(uuid, name, currentScore) {
   currentModalUuid = uuid;
   document.getElementById('modal-name').textContent = name;
@@ -511,7 +560,7 @@ async function submitScore() {
   if (isNaN(s) || s < 0 || s > 100) { toast('Điểm phải từ 0–100', 'warn'); return; }
   await api(`/api/players/${currentModalUuid}/score`, 'PATCH', { score: s });
   closeScoreModal();
-  toast('✅ Đã cập nhật điểm!', 'ok');
+  toast('✅ Đã cập nhật điểm — áp dụng ngay!', 'ok');
   loadPlayers(false); loadStats();
 }
 
@@ -531,25 +580,25 @@ async function submitKick() {
   const reason = document.getElementById('kick-reason').value.trim() || 'Admin kick via dashboard';
   await api(`/api/players/${currentModalUuid}/kick`, 'POST', { reason });
   closeKickModal();
-  toast('🦶 Đã lên lịch kick (áp dụng lần sync tiếp)!', 'warn');
+  toast('🦶 Đã kick ngay lập tức!', 'warn');
   loadPlayers(false); loadStats();
 }
 
 // ── Actions ───────────────────────────────────────────
 async function ban(uuid) {
-  if (!confirm('Cấm vĩnh viễn người chơi này?')) return;
+  if (!confirm('Cấm người chơi này? Sẽ áp dụng ngay lập tức.')) return;
   await api(`/api/players/${uuid}/ban`, 'POST');
-  toast('⛔ Đã cấm. Áp dụng lần sync tiếp.', 'err');
+  toast('⛔ Đã cấm ngay lập tức!', 'err');
   loadPlayers(false); loadStats();
 }
 async function pardon(uuid) {
   await api(`/api/players/${uuid}/pardon`, 'POST');
-  toast('✅ Đã tha lỗi!', 'ok');
+  toast('✅ Đã tha lỗi — áp dụng ngay!', 'ok');
   loadPlayers(false); loadStats();
 }
 async function setGriefer(uuid, flag) {
   await api(`/api/players/${uuid}/griefer`, 'POST', { griefer: flag });
-  toast(flag ? '🚨 Đã đánh dấu Griefer' : '🔓 Đã hủy Griefer', flag ? 'warn' : 'ok');
+  toast(flag ? '🚨 Đã đánh dấu Griefer — áp dụng ngay!' : '🔓 Đã hủy Griefer — áp dụng ngay!', flag ? 'warn' : 'ok');
   loadPlayers(false); loadStats();
 }
 
