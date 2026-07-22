@@ -367,7 +367,7 @@ function renderTable(players) {
     return `<tr>
       <td>
         <a href="#" style="color:var(--accent);text-decoration:none;font-weight:600"
-           onclick="showDetail('${p.uuid}');return false">${escHtml(p.lastName)}</a>
+           onclick="showDetail('${p._id}');return false">${escHtml(p.lastName)}</a>
         ${p.serverName ? `<br><small style="color:var(--muted)">🖥 ${escHtml(p.serverName)}</small>` : ''}
       </td>
       <td>
@@ -383,14 +383,14 @@ function renderTable(players) {
       <td class="uuid-cell" title="${p.uuid}">${shortUuid}</td>
       <td>
         <div class="actions">
-          <button onclick="openScoreModal('${p.uuid}','${escHtml(p.lastName)}',${p.score})" title="Điều chỉnh điểm">✏️ Điểm</button>
-          <button class="warn"   onclick="openKickModal('${p.uuid}','${escHtml(p.lastName)}')" title="Kick">🦶 Kick</button>
+          <button onclick="openScoreModal('${p._id}','${escHtml(p.lastName)}',${p.score})" title="Điều chỉnh điểm">✏️ Điểm</button>
+          <button class="warn"   onclick="openKickModal('${p._id}','${escHtml(p.lastName)}')" title="Kick">🦶 Kick</button>
           ${p.banned
-            ? `<button class="ok"     onclick="pardon('${p.uuid}')">✅ Tha</button>`
-            : `<button class="danger" onclick="ban('${p.uuid}')">⛔ Cấm</button>`}
+            ? `<button class="ok"     onclick="pardon('${p._id}')">✅ Tha</button>`
+            : `<button class="danger" onclick="ban('${p._id}')">⛔ Cấm</button>`}
           ${p.griefer
-            ? `<button onclick="setGriefer('${p.uuid}',false)">🔓 Tha Grief</button>`
-            : `<button onclick="setGriefer('${p.uuid}',true)" style="color:var(--purple)">🚨 Grief</button>`}
+            ? `<button onclick="setGriefer('${p._id}',false)">🔓 Tha Grief</button>`
+            : `<button onclick="setGriefer('${p._id}',true)" style="color:var(--purple)">🚨 Grief</button>`}
         </div>
       </td>
     </tr>`;
@@ -444,7 +444,7 @@ async function showDetail(uuid) {
   content.innerHTML = '<div class="center"><div class="loader"></div></div>';
 
   try {
-    const r = await fetch(`${API}/api/players/${encodeURIComponent(uuid)}`);
+    const r = await fetch(`${API}/api/players/${uuid}`); // uuid here is actually _id
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const p = await r.json();
     const sc = scoreClass(p.score);
@@ -473,14 +473,14 @@ async function showDetail(uuid) {
       <div class="detail-section" style="margin-top:16px">
         <h3>Hành động nhanh</h3>
         <div class="actions" style="flex-direction:column;gap:8px">
-          <button onclick="openScoreModal('${p.uuid}','${escHtml(p.lastName)}',${p.score})">✏️ Điều chỉnh điểm</button>
-          <button class="warn" onclick="openKickModal('${p.uuid}','${escHtml(p.lastName)}')">🦶 Kick</button>
+          <button onclick="openScoreModal('${p._id}','${escHtml(p.lastName)}',${p.score})">✏️ Điều chỉnh điểm</button>
+          <button class="warn" onclick="openKickModal('${p._id}','${escHtml(p.lastName)}')" >🦶 Kick</button>
           ${p.banned
-            ? `<button class="ok" onclick="pardon('${p.uuid}');closeDetail()">✅ Tha lỗi (unban)</button>`
-            : `<button class="danger" onclick="ban('${p.uuid}');closeDetail()">⛔ Cấm vĩnh viễn</button>`}
+            ? `<button class="ok" onclick="pardon('${p._id}');closeDetail()">✅ Tha lỗi (unban)</button>`
+            : `<button class="danger" onclick="ban('${p._id}');closeDetail()">⛔ Cấm vĩnh viễn</button>`}
           ${p.griefer
-            ? `<button onclick="setGriefer('${p.uuid}',false);closeDetail()">🔓 Hủy nhãn Griefer</button>`
-            : `<button style="color:var(--purple)" onclick="setGriefer('${p.uuid}',true);closeDetail()">🚨 Đánh dấu Griefer</button>`}
+            ? `<button onclick="setGriefer('${p._id}',false);closeDetail()">🔓 Hủy nhãn Griefer</button>`
+            : `<button style="color:var(--purple)" onclick="setGriefer('${p._id}',true);closeDetail()">🚨 Đánh dấu Griefer</button>`}
         </div>
       </div>
     `;
