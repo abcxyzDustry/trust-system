@@ -136,10 +136,14 @@ app.get('/api/players', async (req, res) => {
   }
 });
 
-// GET /api/players/:uuid
-app.get('/api/players/:uuid', async (req, res) => {
+// GET /api/players/:id (supports both _id and uuid)
+app.get('/api/players/:id', async (req, res) => {
   try {
-    const doc = await Player.findOne({ uuid: req.params.uuid }).lean();
+    const mongoose = require('mongoose');
+    const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
+    const doc = isObjId
+      ? await Player.findById(req.params.id).lean()
+      : await Player.findOne({ uuid: req.params.id }).lean();
     if (!doc) return res.status(404).json({ error: 'Not found' });
     return res.json(doc);
   } catch (err) {
@@ -148,14 +152,17 @@ app.get('/api/players/:uuid', async (req, res) => {
   }
 });
 
-// PATCH /api/players/:uuid/score
-app.patch('/api/players/:uuid/score', async (req, res) => {
+// PATCH /api/players/:id/score
+app.patch('/api/players/:id/score', async (req, res) => {
   try {
     const { score } = req.body;
     if (score === undefined || isNaN(score)) return res.status(400).json({ error: 'score required' });
     const clamped = Math.max(0, Math.min(100, Number(score)));
+    const mongoose = require('mongoose');
+    const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
+    const q = isObjId ? { _id: req.params.id } : { uuid: req.params.id };
     const doc = await Player.findOneAndUpdate(
-      { uuid: req.params.uuid },
+      q,
       { $set: { score: clamped, pendingScore: clamped } },
       { new: true }
     );
@@ -167,11 +174,14 @@ app.patch('/api/players/:uuid/score', async (req, res) => {
   }
 });
 
-// POST /api/players/:uuid/ban
-app.post('/api/players/:uuid/ban', async (req, res) => {
+// POST /api/players/:id/ban
+app.post('/api/players/:id/ban', async (req, res) => {
   try {
+    const mongoose = require('mongoose');
+    const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
+    const q = isObjId ? { _id: req.params.id } : { uuid: req.params.id };
     const doc = await Player.findOneAndUpdate(
-      { uuid: req.params.uuid },
+      q,
       { $set: { banned: true, score: 0, pendingBan: true, pendingScore: 0 } },
       { new: true }
     );
@@ -183,11 +193,14 @@ app.post('/api/players/:uuid/ban', async (req, res) => {
   }
 });
 
-// POST /api/players/:uuid/pardon
-app.post('/api/players/:uuid/pardon', async (req, res) => {
+// POST /api/players/:id/pardon
+app.post('/api/players/:id/pardon', async (req, res) => {
   try {
+    const mongoose = require('mongoose');
+    const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
+    const q = isObjId ? { _id: req.params.id } : { uuid: req.params.id };
     const doc = await Player.findOneAndUpdate(
-      { uuid: req.params.uuid },
+      q,
       { $set: { banned: false, griefer: false, score: BAN_THRESHOLD, pendingBan: false, pendingGriefer: false, pendingScore: BAN_THRESHOLD } },
       { new: true }
     );
@@ -199,11 +212,14 @@ app.post('/api/players/:uuid/pardon', async (req, res) => {
   }
 });
 
-// POST /api/players/:uuid/kick
-app.post('/api/players/:uuid/kick', async (req, res) => {
+// POST /api/players/:id/kick
+app.post('/api/players/:id/kick', async (req, res) => {
   try {
     const { reason = 'Admin kick via dashboard' } = req.body;
-    const doc = await Player.findOne({ uuid: req.params.uuid });
+    const mongoose = require('mongoose');
+    const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
+    const q = isObjId ? { _id: req.params.id } : { uuid: req.params.id };
+    const doc = await Player.findOne(q);
     if (!doc) return res.status(404).json({ error: 'Not found' });
     const newScore = Math.max(0, doc.score - 30);
     doc.score        = newScore;
@@ -219,12 +235,15 @@ app.post('/api/players/:uuid/kick', async (req, res) => {
   }
 });
 
-// POST /api/players/:uuid/griefer
-app.post('/api/players/:uuid/griefer', async (req, res) => {
+// POST /api/players/:id/griefer
+app.post('/api/players/:id/griefer', async (req, res) => {
   try {
     const griefer = req.body.griefer !== false;
+    const mongoose = require('mongoose');
+    const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
+    const q = isObjId ? { _id: req.params.id } : { uuid: req.params.id };
     const doc = await Player.findOneAndUpdate(
-      { uuid: req.params.uuid },
+      q,
       { $set: { griefer, pendingGriefer: griefer } },
       { new: true }
     );
@@ -236,10 +255,13 @@ app.post('/api/players/:uuid/griefer', async (req, res) => {
   }
 });
 
-// DELETE /api/players/:uuid
-app.delete('/api/players/:uuid', async (req, res) => {
+// DELETE /api/players/:id
+app.delete('/api/players/:id', async (req, res) => {
   try {
-    await Player.deleteOne({ uuid: req.params.uuid });
+    const mongoose = require('mongoose');
+    const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
+    const q = isObjId ? { _id: req.params.id } : { uuid: req.params.id };
+    await Player.deleteOne(q);
     return res.json({ ok: true });
   } catch (err) {
     console.error('[api/players/:uuid/delete] error:', err.message);
