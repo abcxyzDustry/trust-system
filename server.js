@@ -713,53 +713,64 @@ app.post('/api/sync/leave', requireSecret, async (req, res) => {
 app.post('/api/sync/update', requireSecret, async (req, res) => {
   try {
     const {
-      uuid, name, score, kick_count, vote_count,
-      griefer, banned, grief_break_count, is_new_player, server_name,
-      score_gain_count,
+      uuid, name, score_delta, kick_count_delta, vote_count_delta,
+      griefer, grief_break_count, is_new_player, server_name,
     } = req.body;
 
     if (!uuid) return res.status(400).json({ error: 'uuid required' });
 
-    let doc = await Player.findOne({ uuid });
-    if (!doc) {
-      doc = new Player({ uuid, lastName: name || 'Unknown' });
-      console.log(`🆕 New player (on update): ${name} (${uuid})`);
-    }
+    const scoreDelta = Number(score_delta) || 0;
+    const kickDelta  = Number(kick_count_delta) || 0;
+    const voteDelta  = Number(vote_count_delta) || 0;
 
-    doc.lastName  = name || doc.lastName;
-    if (score             !== undefined) doc.score             = score;
-    if (kick_count        !== undefined) doc.kickCount        = kick_count;
-    if (vote_count        !== undefined) doc.voteCount        = vote_count;
-    if (score_gain_count  !== undefined) doc.scoreGainCount   = score_gain_count;
-    if (griefer           !== undefined) doc.griefer          = griefer;
-    if (banned            !== undefined) doc.banned           = banned;
-    if (grief_break_count !== undefined) doc.grief_break_count = grief_break_count;
-    if (is_new_player     !== undefined) doc.is_new_player   = is_new_player;
-    doc.serverName = server_name || doc.serverName;
-    doc.lastSeen   = new Date();
+    // Merge kieu DELTA giong het /api/sync (xem giai thich chi tiet o do) — dam bao 1 nguoi choi
+    // duoc sync tu 2 server gan nhu cung luc van cong dung, khong ai "thang" ai.
+    const setStage = {
+      lastName: name ? name : { $ifNull: ['$lastName', 'Unknown'] },
+      score: { $add: [{ $ifNull: ['$score', 100] }, scoreDelta] },
+      kickCount: { $add: [{ $ifNull: ['$kickCount', 0] }, kickDelta] },
+      voteCount: { $add: [{ $ifNull: ['$voteCount', 0] }, voteDelta] },
+      griefer: griefer === true ? true : { $ifNull: ['$griefer', false] },
+      serverName: server_name ? server_name : { $ifNull: ['$serverName', ''] },
+      lastSeen: new Date(),
+    };
+    if (grief_break_count !== undefined) setStage.grief_break_count = grief_break_count;
+    if (is_new_player     !== undefined) setStage.is_new_player   = is_new_player;
+
+    await Player.updateOne(
+      { uuid },
+      [
+        { $set: setStage },
+        { $set: { banned: { $lt: ['$score', BAN_THRESHOLD] } } },
+      ],
+      { upsert: true }
+    );
+
+    const fresh = await Player.findOne({ uuid }).lean();
 
     const updates = [];
-    const hasPending = doc.pendingScore !== null || doc.pendingBan !== null || doc.pendingGriefer !== null || doc.pendingKick !== null || doc.pendingRole !== null;
-    if (hasPending) {
-      const entry = { uuid: doc.uuid };
-      if (doc.pendingScore !== null) entry.score = doc.pendingScore;
-      if (doc.pendingBan !== null) entry.banned = doc.pendingBan;
-      if (doc.pendingGriefer !== null) entry.griefer = doc.pendingGriefer;
-      if (doc.pendingKick !== null) entry.kickReason = doc.pendingKick;
-      if (doc.pendingRole !== null) entry.role = doc.pendingRole;
-      updates.push(entry);
-
-      doc.pendingScore   = null;
-      doc.pendingBan     = null;
-      doc.pendingGriefer = null;
-      doc.pendingKick    = null;
-      doc.pendingRole    = null;
+    if (fresh) {
+      const hasPending = fresh.pendingScore !== null || fresh.pendingBan !== null || fresh.pendingGriefer !== null || fresh.pendingKick !== null || fresh.pendingRole !== null;
+      if (hasPending) {
+        const entry = { uuid: fresh.uuid };
+        if (fresh.pendingScore   !== null) entry.score      = fresh.pendingScore;
+        if (fresh.pendingBan     !== null) entry.banned     = fresh.pendingBan;
+        if (fresh.pendingGriefer !== null) entry.griefer    = fresh.pendingGriefer;
+        if (fresh.pendingKick    !== null) entry.kickReason = fresh.pendingKick;
+        if (fresh.pendingRole    !== null) entry.role       = fresh.pendingRole;
+        updates.push(entry);
+        await Player.updateOne({ uuid }, { $set: { pendingScore: null, pendingBan: null, pendingGriefer: null, pendingKick: null, pendingRole: null } });
+      }
     }
 
-    await doc.save();
-    console.log(`🔄 Player score updated & synced: ${name || doc.lastName} (${uuid})`);
+    console.log(`🔄 Player delta-synced: ${name || uuid} (Δscore=${scoreDelta}, Δkick=${kickDelta}, Δvote=${voteDelta})`);
 
-    return res.json({ ok: true, updates });
+    return res.json({
+      ok: true, uuid,
+      score: fresh?.score, kickCount: fresh?.kickCount, voteCount: fresh?.voteCount,
+      griefer: fresh?.griefer, banned: fresh?.banned,
+      updates,
+    });
   } catch (err) {
     console.error('[sync/update] error:', err.message);
     return res.status(500).json({ error: err.message });
@@ -824,72 +835,94 @@ app.post('/api/sync', requireSecret, async (req, res) => {
 
     const validPlayers = players.filter(p => p && p.uuid);
     if (validPlayers.length === 0) {
-      return res.json({ ok: true, updates: [], received: players.length });
+      return res.json({ ok: true, updates: [], results: [], received: players.length });
     }
 
-    // 1 round-trip: load all existing docs at once (thay vì N findOne tuần tự)
     const uuids = validPlayers.map(p => p.uuid);
-    const existingDocs = await Player.find({ uuid: { $in: uuids } }).lean();
-    const existingMap = new Map(existingDocs.map(d => [d.uuid, d]));
 
-    const bulkOps = [];
-    const updates = [];
+    // ===== Merge kieu DELTA (khong con overwrite tuyet doi) =====
+    // Moi server gui "chenh lech" (score_delta, kick_count_delta, vote_count_delta) so voi lan sync
+    // truoc cua CHINH NO. Dung pipeline-update ($add tren gia tri hien co trong Mongo, co $ifNull cho
+    // truong hop player moi/upsert) -> ket qua LUON cong dung du 4 server cung sync gan nhu dong thoi,
+    // khong con chuyen "ai sync sau thi thang" nua. banned duoc tinh lai NGAY SAU KHI cong diem, tu
+    // gia tri score MOI (khong tin score/banned server tu gui len). griefer chi "leo thang" len true,
+    // khong bao gio bi ha xuong false qua duong nay (giefer=false tu 1 server khac khong duoc phep xoa
+    // co giefer=true da co) — pardon griefer chi thuc hien qua dashboard (pendingGriefer).
+    const bulkOps = validPlayers.map(p => {
+      const scoreDelta = Number(p.score_delta) || 0;
+      const kickDelta  = Number(p.kick_count_delta) || 0;
+      const voteDelta  = Number(p.vote_count_delta) || 0;
 
-    for (const p of validPlayers) {
-      const doc = existingMap.get(p.uuid);
+      const setStage = {
+        uuid: p.uuid,
+        lastName: p.name ? p.name : { $ifNull: ['$lastName', 'Unknown'] },
+        score: { $add: [{ $ifNull: ['$score', 100] }, scoreDelta] },
+        kickCount: { $add: [{ $ifNull: ['$kickCount', 0] }, kickDelta] },
+        voteCount: { $add: [{ $ifNull: ['$voteCount', 0] }, voteDelta] },
+        griefer: p.griefer === true ? true : { $ifNull: ['$griefer', false] },
+        serverName: server_name ? server_name : { $ifNull: ['$serverName', ''] },
+        lastSeen: new Date(),
+      };
+      if (p.grief_break_count !== undefined) setStage.grief_break_count = p.grief_break_count;
+      if (p.is_new_player     !== undefined) setStage.is_new_player   = p.is_new_player;
 
-      if (!doc) {
-        bulkOps.push({
-          insertOne: {
-            document: {
-              uuid: p.uuid, lastName: p.name || 'Unknown',
-              score: p.score ?? 100, kickCount: p.kick_count ?? 0,
-              voteCount: p.vote_count ?? 0, griefer: p.griefer ?? false,
-              banned: p.banned ?? false, serverName: server_name || '',
-              lastSeen: new Date(),
-            }
-          }
-        });
-        continue;
-      }
-
-      const hasPending = doc.pendingScore !== null || doc.pendingBan !== null || doc.pendingGriefer !== null || doc.pendingKick !== null || doc.pendingRole !== null;
-      if (hasPending) {
-        const entry = { uuid: doc.uuid };
-        if (doc.pendingScore !== null) entry.score = doc.pendingScore;
-        if (doc.pendingBan !== null) entry.banned = doc.pendingBan;
-        if (doc.pendingGriefer !== null) entry.griefer = doc.pendingGriefer;
-        if (doc.pendingKick !== null) entry.kickReason = doc.pendingKick;
-        if (doc.pendingRole !== null) entry.role = doc.pendingRole;
-        updates.push(entry);
-      }
-
-      bulkOps.push({
+      return {
         updateOne: {
           filter: { uuid: p.uuid },
-          update: {
-            $set: {
-              lastName: p.name || doc.lastName,
-              score: p.score ?? doc.score,
-              kickCount: p.kick_count ?? doc.kickCount,
-              voteCount: p.vote_count ?? doc.voteCount,
-              griefer: p.griefer ?? doc.griefer,
-              banned: p.banned ?? doc.banned,
-              serverName: server_name || doc.serverName,
-              lastSeen: new Date(),
-              ...(hasPending ? { pendingScore: null, pendingBan: null, pendingGriefer: null, pendingKick: null, pendingRole: null } : {}),
-            }
-          }
+          update: [
+            { $set: setStage },
+            { $set: { banned: { $lt: ['$score', BAN_THRESHOLD] } } }, // tinh lai TU score da hop nhat
+          ],
+          upsert: true,
         }
-      });
-    }
+      };
+    });
 
-    // 1 round-trip: ghi tất cả insert/update cùng lúc (thay vì N save tuần tự)
     if (bulkOps.length > 0) {
       await Player.bulkWrite(bulkOps, { ordered: false });
     }
 
-    return res.json({ ok: true, updates, received: players.length });
+    // 1 round-trip: doc lai gia tri CANONICAL (da hop nhat) de tra ve cho plugin — plugin se dung de
+    // cap nhat local + RESET baseline (delta lan sync ke tiep chi tinh tu day, khong cong don 2 lan).
+    const freshDocs = await Player.find({ uuid: { $in: uuids } }).lean();
+    const freshMap = new Map(freshDocs.map(d => [d.uuid, d]));
+
+    const updates = [];
+    const results = [];
+    const pendingClearOps = [];
+
+    for (const uuid of uuids) {
+      const fresh = freshMap.get(uuid);
+      if (!fresh) continue;
+
+      results.push({
+        uuid: fresh.uuid, score: fresh.score, kickCount: fresh.kickCount,
+        voteCount: fresh.voteCount, griefer: fresh.griefer, banned: fresh.banned,
+      });
+
+      const hasPending = fresh.pendingScore !== null || fresh.pendingBan !== null || fresh.pendingGriefer !== null || fresh.pendingKick !== null || fresh.pendingRole !== null;
+      if (hasPending) {
+        const entry = { uuid: fresh.uuid };
+        if (fresh.pendingScore   !== null) entry.score      = fresh.pendingScore;
+        if (fresh.pendingBan     !== null) entry.banned     = fresh.pendingBan;
+        if (fresh.pendingGriefer !== null) entry.griefer    = fresh.pendingGriefer;
+        if (fresh.pendingKick    !== null) entry.kickReason = fresh.pendingKick;
+        if (fresh.pendingRole    !== null) entry.role       = fresh.pendingRole;
+        updates.push(entry);
+        pendingClearOps.push({
+          updateOne: {
+            filter: { uuid: fresh.uuid },
+            update: { $set: { pendingScore: null, pendingBan: null, pendingGriefer: null, pendingKick: null, pendingRole: null } },
+          }
+        });
+      }
+    }
+
+    if (pendingClearOps.length > 0) {
+      await Player.bulkWrite(pendingClearOps, { ordered: false });
+    }
+
+    return res.json({ ok: true, updates, results, received: players.length });
   } catch (err) {
     console.error('[sync] error:', err.message);
     return res.status(500).json({ error: err.message });
