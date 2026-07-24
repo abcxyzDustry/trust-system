@@ -793,45 +793,74 @@ app.get('/api/pending-updates', requireSecret, async (req, res) => {
 app.post('/api/sync', requireSecret, async (req, res) => {
   try {
     const { server_name, players = [], team_stats = [] } = req.body;
+
+    const validPlayers = players.filter(p => p && p.uuid);
+    if (validPlayers.length === 0) {
+      return res.json({ ok: true, updates: [], received: players.length });
+    }
+
+    // 1 round-trip: load all existing docs at once (thay vì N findOne tuần tự)
+    const uuids = validPlayers.map(p => p.uuid);
+    const existingDocs = await Player.find({ uuid: { $in: uuids } }).lean();
+    const existingMap = new Map(existingDocs.map(d => [d.uuid, d]));
+
+    const bulkOps = [];
     const updates = [];
 
-    for (const p of players) {
-      if (!p.uuid) continue;
-      let doc = await Player.findOne({ uuid: p.uuid });
+    for (const p of validPlayers) {
+      const doc = existingMap.get(p.uuid);
 
       if (!doc) {
-        doc = new Player({
-          uuid: p.uuid, lastName: p.name || 'Unknown',
-          score: p.score ?? 100, kickCount: p.kick_count ?? 0,
-          voteCount: p.vote_count ?? 0, griefer: p.griefer ?? false,
-          banned: p.banned ?? false, serverName: server_name || '',
-          lastSeen: new Date(),
+        bulkOps.push({
+          insertOne: {
+            document: {
+              uuid: p.uuid, lastName: p.name || 'Unknown',
+              score: p.score ?? 100, kickCount: p.kick_count ?? 0,
+              voteCount: p.vote_count ?? 0, griefer: p.griefer ?? false,
+              banned: p.banned ?? false, serverName: server_name || '',
+              lastSeen: new Date(),
+            }
+          }
         });
-        await doc.save();
-      } else {
-        doc.lastName = p.name || doc.lastName;
-        doc.score = p.score ?? doc.score;
-        doc.kickCount = p.kick_count ?? doc.kickCount;
-        doc.voteCount = p.vote_count ?? doc.voteCount;
-        doc.griefer = p.griefer ?? doc.griefer;
-        doc.banned = p.banned ?? doc.banned;
-        doc.serverName = server_name || doc.serverName;
-        doc.lastSeen = new Date();
-
-        const hasPending = doc.pendingScore !== null || doc.pendingBan !== null || doc.pendingGriefer !== null || doc.pendingKick !== null || doc.pendingRole !== null;
-        if (hasPending) {
-          const entry = { uuid: doc.uuid };
-          if (doc.pendingScore !== null) entry.score = doc.pendingScore;
-          if (doc.pendingBan !== null) entry.banned = doc.pendingBan;
-          if (doc.pendingGriefer !== null) entry.griefer = doc.pendingGriefer;
-          if (doc.pendingKick !== null) entry.kickReason = doc.pendingKick;
-          if (doc.pendingRole !== null) entry.role = doc.pendingRole;
-          updates.push(entry);
-          doc.pendingScore = null; doc.pendingBan = null; doc.pendingGriefer = null; doc.pendingKick = null; doc.pendingRole = null;
-        }
-        await doc.save();
+        continue;
       }
+
+      const hasPending = doc.pendingScore !== null || doc.pendingBan !== null || doc.pendingGriefer !== null || doc.pendingKick !== null || doc.pendingRole !== null;
+      if (hasPending) {
+        const entry = { uuid: doc.uuid };
+        if (doc.pendingScore !== null) entry.score = doc.pendingScore;
+        if (doc.pendingBan !== null) entry.banned = doc.pendingBan;
+        if (doc.pendingGriefer !== null) entry.griefer = doc.pendingGriefer;
+        if (doc.pendingKick !== null) entry.kickReason = doc.pendingKick;
+        if (doc.pendingRole !== null) entry.role = doc.pendingRole;
+        updates.push(entry);
+      }
+
+      bulkOps.push({
+        updateOne: {
+          filter: { uuid: p.uuid },
+          update: {
+            $set: {
+              lastName: p.name || doc.lastName,
+              score: p.score ?? doc.score,
+              kickCount: p.kick_count ?? doc.kickCount,
+              voteCount: p.vote_count ?? doc.voteCount,
+              griefer: p.griefer ?? doc.griefer,
+              banned: p.banned ?? doc.banned,
+              serverName: server_name || doc.serverName,
+              lastSeen: new Date(),
+              ...(hasPending ? { pendingScore: null, pendingBan: null, pendingGriefer: null, pendingKick: null, pendingRole: null } : {}),
+            }
+          }
+        }
+      });
     }
+
+    // 1 round-trip: ghi tất cả insert/update cùng lúc (thay vì N save tuần tự)
+    if (bulkOps.length > 0) {
+      await Player.bulkWrite(bulkOps, { ordered: false });
+    }
+
     return res.json({ ok: true, updates, received: players.length });
   } catch (err) {
     console.error('[sync] error:', err.message);
