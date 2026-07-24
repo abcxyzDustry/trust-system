@@ -453,7 +453,15 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
 // Track connected game servers: ws -> { serverName, lastPing }
+// (Lưu ý: đây là kết nối WS từ trình duyệt dashboard, KHÔNG phải server Mindustry —
+//  plugin TrustSync chỉ gọi HTTP, không mở WebSocket.)
 const connectedServers = new Map();
+
+// Registry các server Mindustry đang gửi sync (qua POST /api/sync), key = server_name.
+// Cập nhật mỗi lần /api/sync được gọi (mỗi ~5 phút/server). Không cần lưu Mongo vì
+// đây là dữ liệu "hiện diện" tạm thời — mất khi restart cũng tự có lại sau lần sync kế tiếp.
+const gameServers = new Map(); // serverName -> {serverName, ip, port, desc, modeName, mapName, playerCount, lastSeen}
+const SERVER_ONLINE_THRESHOLD_MS = 6 * 60 * 1000; // 6 phút (chu kỳ sync là 5 phút)
 
 // ── WebSocket handlers ─────────────────────────────────
 wss.on('connection', (ws, req) => {
@@ -792,7 +800,21 @@ app.get('/api/pending-updates', requireSecret, async (req, res) => {
 // POST /api/sync  ← (backward compat — periodic sync cũ)
 app.post('/api/sync', requireSecret, async (req, res) => {
   try {
-    const { server_name, players = [], team_stats = [] } = req.body;
+    const { server_name, players = [], team_stats = [], ip, port, desc, mode_name, map_name, player_count } = req.body;
+
+    if (server_name) {
+      const prev = gameServers.get(server_name) || {};
+      gameServers.set(server_name, {
+        serverName: server_name,
+        ip: ip || prev.ip || '',
+        port: (port !== undefined && port !== null) ? port : (prev.port ?? null),
+        desc: (desc !== undefined) ? desc : (prev.desc || ''),
+        modeName: mode_name || prev.modeName || '',
+        mapName: map_name || prev.mapName || '',
+        playerCount: (player_count !== undefined) ? player_count : players.length,
+        lastSeen: Date.now(),
+      });
+    }
 
     const validPlayers = players.filter(p => p && p.uuid);
     if (validPlayers.length === 0) {
@@ -931,12 +953,13 @@ app.post('/api/sync/role-update', requireSecret, async (req, res) => {
 
 app.get('/api/players', async (req, res) => {
   try {
-    const { search = '', page = 1, limit = 30, sort = 'lastName', order = 'asc', role = '', status = '' } = req.query;
+    const { search = '', page = 1, limit = 30, sort = 'lastName', order = 'asc', role = '', status = '', server_name = '' } = req.query;
     let q = search ? { $or: [
       { lastName: { $regex: search, $options: 'i' } },
       { uuid: { $regex: search, $options: 'i' } },
       { serverName: { $regex: search, $options: 'i' } },
     ] } : {};
+    if (server_name) q = { ...q, serverName: server_name };
     if (role) q = { ...q, role };
     if (status === 'banned') q = { ...q, banned: true };
     else if (status === 'griefer') q = { ...q, griefer: true };
@@ -961,6 +984,14 @@ app.get('/api/players/:id', async (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
+});
+
+app.get('/api/servers', (req, res) => {
+  const now = Date.now();
+  const servers = Array.from(gameServers.values())
+    .map(s => ({ ...s, online: (now - s.lastSeen) < SERVER_ONLINE_THRESHOLD_MS }))
+    .sort((a, b) => a.serverName.localeCompare(b.serverName));
+  return res.json({ servers, total: servers.length });
 });
 
 app.get('/api/connections', (req, res) => {
@@ -1096,6 +1127,8 @@ return res.json({
       avgScore: Math.round(avg[0]?.avg ?? 0),
       admins, coOwners,
       connectedServers: connectedServers.size,
+      onlineServers: Array.from(gameServers.values()).filter(s => (Date.now() - s.lastSeen) < SERVER_ONLINE_THRESHOLD_MS).length,
+      totalServers: gameServers.size,
       discordBot: discordReady,
     });
   } catch (err) {
