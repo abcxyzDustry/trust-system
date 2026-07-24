@@ -126,6 +126,7 @@ function initDiscordBot() {
                 { name: '!trust ban <tên hoặc uuid>', value: 'Cấm vĩnh viễn (score=0)', inline: false },
                 { name: '!trust pardon <tên hoặc uuid>', value: 'Gỡ cấm (score=30)', inline: false },
                 { name: '!trust griefer <tên hoặc uuid> <on|off>', value: 'Bật/tắt griefer lock', inline: false },
+                { name: '!trust role <tên hoặc uuid> <player|admin|co-owner>', value: 'Chỉnh role player', inline: false },
                 { name: '!trust stats', value: 'Thống kê tổng quan', inline: false },
               ],
               footer: { text: 'TrustSystem Bot' },
@@ -153,7 +154,8 @@ function initDiscordBot() {
             const lines = players.map((p, i) => {
               const rank = (page - 1) * limit + i + 1;
               const status = p.banned ? '🔴 BAN' : p.griefer ? '🟡 GRIEF' : p.score < 50 ? '🟠 LOW' : '🟢';
-              return `\`${rank}.\` ${status} **${p.lastName}** — ${p.score}₫ | Kick: ${p.kickCount} | ${p.serverName || '?'}`;
+                           const roleIcon = p.role === 'owner' ? '👑 ' : p.role === 'co-owner' ? '💎 ' : p.role === 'admin' ? '🔰 ' : '';
+return `\`${rank}.\` ${status} **${roleIcon}${p.lastName}** — ${p.score}₫ | Kick: ${p.kickCount} | ${p.serverName || '?'}`;
             });
 
             msg.channel.send({
@@ -185,6 +187,7 @@ function initDiscordBot() {
                 color: doc.banned ? 0xff4757 : doc.griefer ? 0xffa502 : 0x2ed573,
                 fields: [
                   { name: 'UUID', value: `\`${doc.uuid}\``, inline: false },
+                  { name: 'Role', value: doc.role || 'player', inline: true },
                   { name: 'Trust Score', value: `${doc.score}₫`, inline: true },
                   { name: 'Status', value: status, inline: true },
                   { name: 'Kick Count', value: String(doc.kickCount), inline: true },
@@ -294,6 +297,7 @@ function initDiscordBot() {
               [
                 { name: 'Player', value: doc.lastName, inline: true },
                 { name: 'UUID', value: `\`${doc.uuid}\``, inline: false },
+                  { name: 'Role', value: doc.role || 'player', inline: true },
               ]
             );
             msg.reply(`🔴 Đã cấm vĩnh viễn **${doc.lastName}** (${doc.uuid})`);
@@ -362,6 +366,40 @@ function initDiscordBot() {
             break;
           }
 
+          case 'role': {
+            if (args.length < 2) { msg.reply('❌ Cú pháp: `!trust role <tên hoặc uuid> <player|admin|co-owner>`'); break; }
+            const roleVal = args[args.length - 1].toLowerCase();
+            const nameQuery = args.slice(0, -1).join(' ');
+            
+            const validRoles = ['player', 'admin', 'co-owner', 'owner'];
+            if (!validRoles.includes(roleVal)) { msg.reply('❌ Role không hợp lệ. Chọn một trong: player, admin, co-owner'); break; }
+
+            const isUuid = nameQuery.length > 20 && /^[a-f0-9]/i.test(nameQuery);
+            const doc = await Player.findOne(isUuid
+              ? { uuid: { $regex: nameQuery, $options: 'i' } }
+              : { lastName: { $regex: nameQuery, $options: 'i' } }
+            );
+            if (!doc) { msg.reply(`❌ Không tìm thấy: \`${nameQuery}\``); break; }
+
+            const oldRole = doc.role || 'player';
+            doc.role = roleVal;
+            doc.pendingRole = roleVal;
+            await doc.save();
+
+            pushUpdate(doc.uuid, { role: roleVal });
+            sendDiscordWebhook(
+              '👑 Role Changed',
+              `Admin **${msg.author.tag}** đã chỉnh role`,
+              0xa29bfe,
+              [
+                { name: 'Player', value: doc.lastName, inline: true },
+                { name: 'Cũ → Mới', value: `${oldRole} → ${roleVal}`, inline: true },
+              ]
+            );
+            msg.reply(`👑 Đã chỉnh role **${doc.lastName}**: ${oldRole} → **${roleVal}**`);
+            break;
+          }
+
           case 'stats': {
             const total = await Player.countDocuments();
             const banned = await Player.countDocuments({ banned: true });
@@ -370,7 +408,9 @@ function initDiscordBot() {
             const avgAgg = await Player.aggregate([{ $group: { _id: null, avg: { $avg: '$score' } } }]);
             const avgScore = Math.round(avgAgg[0]?.avg ?? 0);
 
-            msg.channel.send({
+                        const admins = await Player.countDocuments({ role: 'admin' });
+            const coOwners = await Player.countDocuments({ role: 'co-owner' });
+msg.channel.send({
               embeds: [{
                 title: '📊 Thống kê TrustSystem',
                 color: 0x00d2ff,
@@ -379,6 +419,8 @@ function initDiscordBot() {
                   { name: 'Banned', value: String(banned), inline: true },
                   { name: 'Griefers', value: String(griefer), inline: true },
                   { name: 'At Risk (<50₫)', value: String(atRisk), inline: true },
+                  { name: 'Admins', value: String(admins), inline: true },
+                  { name: 'Co-Owners', value: String(coOwners), inline: true },
                   { name: 'Avg Score', value: `${avgScore}₫`, inline: true },
                   { name: 'Servers Online', value: String(connectedServers.size), inline: true },
                 ],
@@ -490,6 +532,8 @@ const playerSchema = new mongoose.Schema({
   pendingBan:     { type: Boolean, default: null },
   pendingGriefer: { type: Boolean, default: null },
   pendingKick:    { type: String, default: null },
+  role:           { type: String, default: 'player', enum: ['player','admin','co-owner','owner'] },
+  pendingRole:    { type: String, default: null },
   serverName:     { type: String, default: '' },
   lastSeen:       { type: Date, default: Date.now },
   createdAt:      { type: Date, default: Date.now },
@@ -523,6 +567,7 @@ app.post('/api/sync/join', requireSecret, async (req, res) => {
         serverName: server_name || '',
         lastSeen: new Date(),
       });
+      if (req.body.role) doc.role = req.body.role;
       await doc.save();
       console.log(`🆕 New player: ${name} (${uuid})`);
 
@@ -542,6 +587,7 @@ app.post('/api/sync/join', requireSecret, async (req, res) => {
       doc.lastName   = name || doc.lastName;
       doc.serverName  = server_name || doc.serverName;
       doc.lastSeen    = new Date();
+      if (req.body.role) doc.role = req.body.role;
       await doc.save();
       console.log(`👋 Player joined: ${name} (${uuid})`);
 
@@ -570,6 +616,7 @@ app.post('/api/sync/join', requireSecret, async (req, res) => {
         voteCount:          doc.voteCount,
         grief_break_count:  doc.grief_break_count,
         is_new_player:      doc.is_new_player,
+        role:               doc.role,
       },
     });
   } catch (err) {
@@ -612,6 +659,7 @@ app.post('/api/sync/leave', requireSecret, async (req, res) => {
     doc.pendingBan     = null;
     doc.pendingGriefer = null;
     doc.pendingKick    = null;
+    doc.pendingRole    = null;
 
     await doc.save();
     console.log(`📤 Player left & synced: ${name} (${uuid})`);
@@ -646,6 +694,63 @@ app.post('/api/sync/leave', requireSecret, async (req, res) => {
   }
 });
 
+// POST /api/sync/update  ← plugin gọi khi player score thay đổi
+app.post('/api/sync/update', requireSecret, async (req, res) => {
+  try {
+    const {
+      uuid, name, score, kick_count, vote_count,
+      griefer, banned, grief_break_count, is_new_player, server_name,
+      score_gain_count,
+    } = req.body;
+
+    if (!uuid) return res.status(400).json({ error: 'uuid required' });
+
+    let doc = await Player.findOne({ uuid });
+    if (!doc) {
+      doc = new Player({ uuid, lastName: name || 'Unknown' });
+      console.log(`🆕 New player (on update): ${name} (${uuid})`);
+    }
+
+    doc.lastName  = name || doc.lastName;
+    if (score             !== undefined) doc.score             = score;
+    if (kick_count        !== undefined) doc.kickCount        = kick_count;
+    if (vote_count        !== undefined) doc.voteCount        = vote_count;
+    if (score_gain_count  !== undefined) doc.scoreGainCount   = score_gain_count;
+    if (griefer           !== undefined) doc.griefer          = griefer;
+    if (banned            !== undefined) doc.banned           = banned;
+    if (grief_break_count !== undefined) doc.grief_break_count = grief_break_count;
+    if (is_new_player     !== undefined) doc.is_new_player   = is_new_player;
+    doc.serverName = server_name || doc.serverName;
+    doc.lastSeen   = new Date();
+
+    const updates = [];
+    const hasPending = doc.pendingScore !== null || doc.pendingBan !== null || doc.pendingGriefer !== null || doc.pendingKick !== null || doc.pendingRole !== null;
+    if (hasPending) {
+      const entry = { uuid: doc.uuid };
+      if (doc.pendingScore !== null) entry.score = doc.pendingScore;
+      if (doc.pendingBan !== null) entry.banned = doc.pendingBan;
+      if (doc.pendingGriefer !== null) entry.griefer = doc.pendingGriefer;
+      if (doc.pendingKick !== null) entry.kickReason = doc.pendingKick;
+      if (doc.pendingRole !== null) entry.role = doc.pendingRole;
+      updates.push(entry);
+
+      doc.pendingScore   = null;
+      doc.pendingBan     = null;
+      doc.pendingGriefer = null;
+      doc.pendingKick    = null;
+      doc.pendingRole    = null;
+    }
+
+    await doc.save();
+    console.log(`🔄 Player score updated & synced: ${name || doc.lastName} (${uuid})`);
+
+    return res.json({ ok: true, updates });
+  } catch (err) {
+    console.error('[sync/update] error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/pending-updates ← plugin poll mỗi 2 giây
 app.get('/api/pending-updates', requireSecret, async (req, res) => {
   try {
@@ -655,6 +760,7 @@ app.get('/api/pending-updates', requireSecret, async (req, res) => {
         { pendingBan:     { $ne: null } },
         { pendingGriefer: { $ne: null } },
         { pendingKick:    { $ne: null } },
+        { pendingRole:    { $ne: null } }
       ]
     }).lean();
 
@@ -664,13 +770,14 @@ app.get('/api/pending-updates', requireSecret, async (req, res) => {
       if (p.pendingBan     !== null) entry.banned     = p.pendingBan;
       if (p.pendingGriefer !== null) entry.griefer    = p.pendingGriefer;
       if (p.pendingKick    !== null) entry.kickReason = p.pendingKick;
+      if (p.pendingRole    !== null) entry.role       = p.pendingRole;
       return entry;
     });
 
     if (players.length > 0) {
       await Player.updateMany(
         { _id: { $in: players.map(p => p._id) } },
-        { $set: { pendingScore: null, pendingBan: null, pendingGriefer: null, pendingKick: null } }
+        { $set: { pendingScore: null, pendingBan: null, pendingGriefer: null, pendingKick: null, pendingRole: null } }
       );
     }
 
@@ -710,15 +817,16 @@ app.post('/api/sync', requireSecret, async (req, res) => {
         doc.serverName = server_name || doc.serverName;
         doc.lastSeen = new Date();
 
-        const hasPending = doc.pendingScore !== null || doc.pendingBan !== null || doc.pendingGriefer !== null || doc.pendingKick !== null;
+        const hasPending = doc.pendingScore !== null || doc.pendingBan !== null || doc.pendingGriefer !== null || doc.pendingKick !== null || doc.pendingRole !== null;
         if (hasPending) {
           const entry = { uuid: doc.uuid };
           if (doc.pendingScore !== null) entry.score = doc.pendingScore;
           if (doc.pendingBan !== null) entry.banned = doc.pendingBan;
           if (doc.pendingGriefer !== null) entry.griefer = doc.pendingGriefer;
           if (doc.pendingKick !== null) entry.kickReason = doc.pendingKick;
+          if (doc.pendingRole !== null) entry.role = doc.pendingRole;
           updates.push(entry);
-          doc.pendingScore = null; doc.pendingBan = null; doc.pendingGriefer = null; doc.pendingKick = null;
+          doc.pendingScore = null; doc.pendingBan = null; doc.pendingGriefer = null; doc.pendingKick = null; doc.pendingRole = null;
         }
         await doc.save();
       }
@@ -730,18 +838,79 @@ app.post('/api/sync', requireSecret, async (req, res) => {
   }
 });
 
+// GET /api/player-update (NEW - per-player 30s poll)
+app.get('/api/player-update', requireSecret, async (req, res) => {
+  try {
+    const { uuid } = req.query;
+    if (!uuid) return res.status(400).json({ error: 'uuid required' });
+    
+    const doc = await Player.findOne({ uuid }).lean();
+    if (!doc) return res.json({ update: null });
+    
+    // Only return update if there are pending changes
+    const hasPending = doc.pendingScore !== null || doc.pendingBan !== null || 
+                       doc.pendingGriefer !== null || doc.pendingKick !== null || doc.pendingRole !== null;
+    
+    if (!hasPending) return res.json({ update: null });
+    
+    const update = { uuid: doc.uuid };
+    if (doc.pendingScore !== null) update.score = doc.pendingScore;
+    if (doc.pendingBan !== null) update.banned = doc.pendingBan;
+    if (doc.pendingGriefer !== null) update.griefer = doc.pendingGriefer;
+    if (doc.pendingKick !== null) update.kickReason = doc.pendingKick;
+    if (doc.pendingRole !== null) update.role = doc.pendingRole;
+    
+    // Clear pending after sending
+    await Player.updateOne({ uuid }, { $set: { 
+      pendingScore: null, pendingBan: null, 
+      pendingGriefer: null, pendingKick: null, pendingRole: null 
+    }});
+    
+    return res.json({ update });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sync/role-update (NEW)
+app.post('/api/sync/role-update', requireSecret, async (req, res) => {
+  try {
+    const { uuid, role, name, server_name } = req.body;
+    if (!uuid || !role) return res.status(400).json({ error: 'uuid and role required' });
+    
+    const validRoles = ['player', 'admin', 'co-owner', 'owner'];
+    if (!validRoles.includes(role)) return res.status(400).json({ error: 'invalid role' });
+    
+    const doc = await Player.findOneAndUpdate(
+      { uuid },
+      { $set: { role, ...(name ? { lastName: name } : {}), ...(server_name ? { serverName: server_name } : {}), lastSeen: new Date() } },
+      { new: true, upsert: true }
+    );
+    
+    pushUpdate(doc.uuid, { role });
+    console.log(`[role-update] ${doc.lastName} (${uuid}) → ${role}`);
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════
 //  Admin REST API
 // ═══════════════════════════════════════════════════════
 
 app.get('/api/players', async (req, res) => {
   try {
-    const { search = '', page = 1, limit = 30, sort = 'lastName', order = 'asc' } = req.query;
-    const q = search ? { $or: [
+    const { search = '', page = 1, limit = 30, sort = 'lastName', order = 'asc', role = '', status = '' } = req.query;
+    let q = search ? { $or: [
       { lastName: { $regex: search, $options: 'i' } },
       { uuid: { $regex: search, $options: 'i' } },
       { serverName: { $regex: search, $options: 'i' } },
     ] } : {};
+    if (role) q = { ...q, role };
+    if (status === 'banned') q = { ...q, banned: true };
+    else if (status === 'griefer') q = { ...q, griefer: true };
+    else if (status === 'atrisk') q = { ...q, score: { $lt: 50, $gte: 30 } };
     const sortObj = { [sort]: order === 'desc' ? -1 : 1 };
     const total = await Player.countDocuments(q);
     const players = await Player.find(q).sort(sortObj).skip((page - 1) * limit).limit(Number(limit)).lean();
@@ -783,6 +952,23 @@ app.patch('/api/players/:id/score', async (req, res) => {
     if (!doc) return res.status(404).json({ error: 'Not found' });
     pushUpdate(doc.uuid, { score: clamped });
     sendDiscordWebhook('📝 Score changed (Web)', `**${doc.lastName}** → ${clamped}₫`, 0x00d2ff);
+    return res.json({ ok: true, player: doc });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/players/:id/role', async (req, res) => {
+  try {
+    const { role } = req.body;
+    const validRoles = ['player', 'admin', 'co-owner', 'owner'];
+    if (!validRoles.includes(role)) return res.status(400).json({ error: 'invalid role' });
+    const isObjId = mongoose.Types.ObjectId.isValid(req.params.id);
+    const q = isObjId ? { _id: req.params.id } : { uuid: req.params.id };
+    const doc = await Player.findOneAndUpdate(q, { $set: { role, pendingRole: role } }, { new: true });
+    if (!doc) return res.status(404).json({ error: 'Not found' });
+    pushUpdate(doc.uuid, { role });
+    sendDiscordWebhook('👑 Role Changed (Web)', `**${doc.lastName}** → ${role}`, 0xa29bfe);
     return res.json({ ok: true, player: doc });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -873,9 +1059,12 @@ app.get('/api/stats', async (req, res) => {
     const griefer = await Player.countDocuments({ griefer: true });
     const atRisk = await Player.countDocuments({ score: { $lt: 50, $gte: BAN_THRESHOLD } });
     const avg = await Player.aggregate([{ $group: { _id: null, avg: { $avg: '$score' } } }]);
-    return res.json({
+        const admins = await Player.countDocuments({ role: 'admin' });
+    const coOwners = await Player.countDocuments({ role: 'co-owner' });
+return res.json({
       total, banned, griefer, atRisk,
       avgScore: Math.round(avg[0]?.avg ?? 0),
+      admins, coOwners,
       connectedServers: connectedServers.size,
       discordBot: discordReady,
     });
