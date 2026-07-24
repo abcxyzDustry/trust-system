@@ -149,6 +149,18 @@
   /* ─── Empty ─── */
   .empty{text-align:center;padding:40px;color:var(--muted)}
 
+  /* ─── Server panel ─── */
+  .server-panel{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+  .server-chip{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    padding:8px 14px;display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.8rem;transition:.15s}
+  .server-chip:hover{border-color:var(--accent)}
+  .server-chip.active{border-color:var(--accent);background:var(--surface2)}
+  .server-chip .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex-shrink:0}
+  .server-chip.online .dot{background:var(--ok);box-shadow:0 0 5px var(--ok)}
+  .server-chip.offline .dot{background:var(--danger)}
+  .server-chip small{color:var(--muted);white-space:nowrap}
+  .server-panel .empty-inline{color:var(--muted);font-size:.8rem;padding:8px 0}
+
   /* ─── Responsive ─── */
   @media(max-width:700px){
     .actions{flex-direction:column}
@@ -187,6 +199,12 @@
     <div class="stat-card"><div class="val c-purple" id="s-griefer">—</div><div class="lbl">Griefer</div></div>
     <div class="stat-card"><div class="val" id="s-admins" style="color:#74b9ff">—</div><div class="lbl">Admin</div></div>
     <div class="stat-card"><div class="val" id="s-coowners" style="color:#a29bfe">—</div><div class="lbl">Co-Owner</div></div>
+    <div class="stat-card"><div class="val" id="s-servers" style="color:#00d2ff">—</div><div class="lbl">Server online</div></div>
+  </div>
+
+  <!-- Server panel -->
+  <div class="server-panel" id="server-panel">
+    <span class="empty-inline">Đang tải danh sách server…</span>
   </div>
 
   <!-- Toolbar -->
@@ -197,6 +215,10 @@
       </svg>
       <input type="text" id="search" placeholder="Tìm kiếm tên, UUID, server…" oninput="debounceSearch()"/>
     </div>
+
+    <select id="filter-server" onchange="page=1;loadPlayers()">
+      <option value="">🖥 Tất cả server</option>
+    </select>
 
     <select id="filter-sort" onchange="loadPlayers()">
       <option value="lastName-asc">Tên A→Z</option>
@@ -217,7 +239,7 @@
       <option value="co-owner">Chỉ Co-Owner</option>
     </select>
 
-    <button onclick="loadPlayers();loadStats()">🔄 Làm mới</button>
+    <button onclick="loadPlayers();loadStats();loadServers()">🔄 Làm mới</button>
   </div>
 
   <!-- Table -->
@@ -316,8 +338,9 @@ let ws = null;
 // ── Init ──────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   loadStats();
+  loadServers();
   loadPlayers();
-  setInterval(() => { loadStats(); loadPlayers(false); }, 30000);
+  setInterval(() => { loadStats(); loadPlayers(false); loadServers(); }, 30000);
   connectWS();
 });
 
@@ -373,6 +396,58 @@ function updateWSStatus(connected) {
   }
 }
 
+// ── Servers (nhiều server Mindustry cùng sync về backend này) ──
+async function loadServers() {
+  try {
+    const r = await fetch(`${API}/api/servers`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    const servers = d.servers || [];
+    renderServerPanel(servers);
+    populateServerSelect(servers);
+    const onlineCount = servers.filter(s => s.online).length;
+    document.getElementById('s-servers').textContent = `${onlineCount}/${servers.length}`;
+  } catch (e) {
+    console.error('Load servers error:', e);
+  }
+}
+
+function renderServerPanel(servers) {
+  const wrap = document.getElementById('server-panel');
+  if (!servers.length) {
+    wrap.innerHTML = '<span class="empty-inline">Chưa có server nào gửi sync về backend này.</span>';
+    return;
+  }
+  const selected = document.getElementById('filter-server')?.value || '';
+  wrap.innerHTML = servers.map(s => {
+    const modeMap = [s.modeName, s.mapName].filter(Boolean).join(' · ');
+    const addr = (s.ip || '?') + (s.port ? ':' + s.port : '');
+    return `<div class="server-chip ${s.online ? 'online' : 'offline'} ${selected === s.serverName ? 'active' : ''}"
+                 onclick="filterByServer('${escHtml(s.serverName)}')"
+                 title="${escHtml(s.desc || '')}">
+      <span class="dot"></span>
+      <strong>${escHtml(s.serverName)}</strong>
+      <small>${escHtml(addr)}${modeMap ? ' · ' + escHtml(modeMap) : ''} · ${s.playerCount ?? 0}👤</small>
+    </div>`;
+  }).join('');
+}
+
+function populateServerSelect(servers) {
+  const sel = document.getElementById('filter-server');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">🖥 Tất cả server</option>' +
+    servers.map(s => `<option value="${escHtml(s.serverName)}">${s.online ? '🟢' : '⚪'} ${escHtml(s.serverName)}</option>`).join('');
+  if (servers.some(s => s.serverName === current)) sel.value = current;
+}
+
+function filterByServer(name) {
+  const sel = document.getElementById('filter-server');
+  sel.value = (sel.value === name) ? '' : name; // click lại để bỏ chọn
+  page = 1;
+  loadPlayers();
+  loadServers(); // để cập nhật trạng thái "active" trên chip
+}
+
 // ── Stats ─────────────────────────────────────────────
 async function loadStats() {
   try {
@@ -400,6 +475,7 @@ async function loadStats() {
 async function loadPlayers(showLoading = true) {
   const search = document.getElementById('search').value.trim();
   const filterStatus = document.getElementById('filter-status').value;
+  const filterServer = document.getElementById('filter-server').value;
   const [sf, so] = document.getElementById('filter-sort').value.split('-');
   sortField = sf; sortOrder = so;
 
@@ -411,6 +487,7 @@ async function loadPlayers(showLoading = true) {
 
   let url = `${API}/api/players?page=${page}&limit=30&sort=${sortField}&order=${sortOrder}`;
   if (search)       url += `&search=${encodeURIComponent(search)}`;
+  if (filterServer) url += `&server_name=${encodeURIComponent(filterServer)}`;
   if (filterStatus === 'admin') url += '&role=admin';
   else if (filterStatus === 'co-owner') url += '&role=co-owner';
   else if (filterStatus) url += `&status=${filterStatus}`;
