@@ -607,6 +607,7 @@ app.post('/api/sync/join', requireSecret, async (req, res) => {
 
     return res.json({
       ok: true,
+      is_new: isNew,
       player: {
         uuid:               doc.uuid,
         score:              doc.score,
