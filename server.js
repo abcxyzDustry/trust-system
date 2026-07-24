@@ -463,6 +463,12 @@ const connectedServers = new Map();
 const gameServers = new Map(); // serverName -> {serverName, ip, port, desc, modeName, mapName, playerCount, lastSeen}
 const SERVER_ONLINE_THRESHOLD_MS = 6 * 60 * 1000; // 6 phút (chu kỳ sync là 5 phút)
 
+// Remote control: cho phep dashboard tat/bat auto-sync va kich hoat TAT CA server sync ngay lap tuc, cung 1 thoi diem.
+// Plugin (Java) poll GET /api/sync/control moi ~5s de nhan lenh nay gan nhu tuc thi (khong can WebSocket).
+let globalSyncEnabled = true;             // cong tac tong: tat/bat sync tu dong cho TOAN BO server
+let globalForceSyncNonce = 0;             // moi lan bam "Đồng bộ tất cả ngay" -> +1; server nao thay nonce moi se sync ngay
+const perServerEnabled = new Map();       // serverName -> bool, cho phep tat/bat rieng 1 server (mac dinh true neu khong co)
+
 // ── WebSocket handlers ─────────────────────────────────
 wss.on('connection', (ws, req) => {
   ws.isAlive = true;
@@ -989,9 +995,50 @@ app.get('/api/players/:id', async (req, res) => {
 app.get('/api/servers', (req, res) => {
   const now = Date.now();
   const servers = Array.from(gameServers.values())
-    .map(s => ({ ...s, online: (now - s.lastSeen) < SERVER_ONLINE_THRESHOLD_MS }))
+    .map(s => ({
+      ...s,
+      online: (now - s.lastSeen) < SERVER_ONLINE_THRESHOLD_MS,
+      syncEnabled: globalSyncEnabled && (perServerEnabled.has(s.serverName) ? perServerEnabled.get(s.serverName) : true),
+    }))
     .sort((a, b) => a.serverName.localeCompare(b.serverName));
-  return res.json({ servers, total: servers.length });
+  return res.json({ servers, total: servers.length, globalSyncEnabled, forceSyncNonce: globalForceSyncNonce });
+});
+
+// GET /api/sync/control — plugin (Java) poll endpoint nay moi ~5s de biet co duoc sync khong
+// va co lenh "sync ngay" moi khong (force_sync_nonce). Dung requireSecret giong cac route /api/sync* khac.
+app.get('/api/sync/control', requireSecret, (req, res) => {
+  const { server_name } = req.query;
+  const enabled = globalSyncEnabled && (perServerEnabled.has(server_name) ? perServerEnabled.get(server_name) : true);
+  return res.json({ enabled, force_sync_nonce: globalForceSyncNonce });
+});
+
+// POST /api/servers/sync-toggle  body: { enabled: bool, server_name?: string }
+// Khong co server_name -> ap dung cho TAT CA server (cong tac tong). Co server_name -> chi rieng server do.
+app.post('/api/servers/sync-toggle', (req, res) => {
+  try {
+    const { enabled, server_name } = req.body;
+    if (server_name) {
+      perServerEnabled.set(server_name, !!enabled);
+    } else {
+      globalSyncEnabled = !!enabled;
+    }
+    return res.json({ ok: true, globalSyncEnabled, server_name: server_name || null, enabled: !!enabled });
+  } catch (err) {
+    console.error('[sync-toggle] error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/servers/force-sync — tang nonce toan cuc. Tat ca server dang poll /api/sync/control
+// se thay nonce moi trong vong toi da ~5s va goi syncWithBackend(force=true) ngay lap tuc, cung 1 luc.
+app.post('/api/servers/force-sync', (req, res) => {
+  try {
+    globalForceSyncNonce++;
+    return res.json({ ok: true, force_sync_nonce: globalForceSyncNonce });
+  } catch (err) {
+    console.error('[force-sync] error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/api/connections', (req, res) => {
@@ -1129,6 +1176,7 @@ return res.json({
       connectedServers: connectedServers.size,
       onlineServers: Array.from(gameServers.values()).filter(s => (Date.now() - s.lastSeen) < SERVER_ONLINE_THRESHOLD_MS).length,
       totalServers: gameServers.size,
+      globalSyncEnabled,
       discordBot: discordReady,
     });
   } catch (err) {
