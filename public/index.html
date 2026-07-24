@@ -240,6 +240,9 @@
     </select>
 
     <button onclick="loadPlayers();loadStats();loadServers()">🔄 Làm mới</button>
+
+    <button id="btn-sync-toggle" class="danger" onclick="toggleGlobalSync()" title="Bật/tắt sync tự động cho TẤT CẢ server">⏸ Tắt sync tự động</button>
+    <button class="primary" onclick="forceSyncAll()" title="Yêu cầu TẤT CẢ server đồng bộ ngay lập tức, cùng một thời điểm">⚡ Đồng bộ tất cả ngay</button>
   </div>
 
   <!-- Table -->
@@ -334,6 +337,7 @@ let sortField = 'score', sortOrder = 'desc';
 let searchTimer = null;
 let currentModalUuid = null;
 let ws = null;
+let globalSyncEnabledClient = true; // cache trạng thái công tắc tổng, cập nhật từ /api/servers
 
 // ── Init ──────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -403,6 +407,8 @@ async function loadServers() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
     const servers = d.servers || [];
+    globalSyncEnabledClient = d.globalSyncEnabled !== false;
+    updateSyncToggleButton();
     renderServerPanel(servers);
     populateServerSelect(servers);
     const onlineCount = servers.filter(s => s.online).length;
@@ -410,6 +416,42 @@ async function loadServers() {
   } catch (e) {
     console.error('Load servers error:', e);
   }
+}
+
+// ── Remote control: bật/tắt sync tự động + đồng bộ tất cả ngay ──
+function updateSyncToggleButton() {
+  const btn = document.getElementById('btn-sync-toggle');
+  if (!btn) return;
+  if (globalSyncEnabledClient) {
+    btn.textContent = '⏸ Tắt sync tự động';
+    btn.className = 'danger';
+  } else {
+    btn.textContent = '▶ Bật lại sync tự động';
+    btn.className = 'ok';
+  }
+}
+
+async function toggleGlobalSync() {
+  const newState = !globalSyncEnabledClient;
+  const msg = newState
+    ? 'Bật lại sync tự động cho TẤT CẢ server?'
+    : 'Tắt sync tự động cho TẤT CẢ server ngay bây giờ? (server sẽ dừng gửi sync định kỳ trong vòng ~5s tới)';
+  if (!confirm(msg)) return;
+  try {
+    const d = await api('/api/servers/sync-toggle', 'POST', { enabled: newState });
+    globalSyncEnabledClient = d.globalSyncEnabled;
+    updateSyncToggleButton();
+    toast(newState ? '▶ Đã bật lại sync tự động cho tất cả server' : '⏸ Đã yêu cầu TẮT sync tự động cho tất cả server', newState ? 'ok' : 'warn');
+    loadServers();
+  } catch (e) {}
+}
+
+async function forceSyncAll() {
+  if (!confirm('Yêu cầu TẤT CẢ server đồng bộ ngay lập tức, cùng một thời điểm?')) return;
+  try {
+    await api('/api/servers/force-sync', 'POST', {});
+    toast('⚡ Đã gửi lệnh — các server sẽ đồng bộ trong vài giây tới', 'ok');
+  } catch (e) {}
 }
 
 function renderServerPanel(servers) {
@@ -422,11 +464,12 @@ function renderServerPanel(servers) {
   wrap.innerHTML = servers.map(s => {
     const modeMap = [s.modeName, s.mapName].filter(Boolean).join(' · ');
     const addr = (s.ip || '?') + (s.port ? ':' + s.port : '');
+    const syncIcon = s.syncEnabled ? '' : ' ⏸';
     return `<div class="server-chip ${s.online ? 'online' : 'offline'} ${selected === s.serverName ? 'active' : ''}"
                  onclick="filterByServer('${escHtml(s.serverName)}')"
-                 title="${escHtml(s.desc || '')}">
+                 title="${escHtml(s.desc || '')}${s.syncEnabled ? '' : ' — Sync tự động đang TẮT'}">
       <span class="dot"></span>
-      <strong>${escHtml(s.serverName)}</strong>
+      <strong>${escHtml(s.serverName)}${syncIcon}</strong>
       <small>${escHtml(addr)}${modeMap ? ' · ' + escHtml(modeMap) : ''} · ${s.playerCount ?? 0}👤</small>
     </div>`;
   }).join('');
