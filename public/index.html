@@ -185,6 +185,8 @@
     <div class="stat-card"><div class="val c-warn"   id="s-atrisk">—</div><div class="lbl">Nguy hiểm (&lt;50₫)</div></div>
     <div class="stat-card"><div class="val c-danger" id="s-banned">—</div><div class="lbl">Bị cấm (&lt;30₫)</div></div>
     <div class="stat-card"><div class="val c-purple" id="s-griefer">—</div><div class="lbl">Griefer</div></div>
+    <div class="stat-card"><div class="val" id="s-admins" style="color:#74b9ff">—</div><div class="lbl">Admin</div></div>
+    <div class="stat-card"><div class="val" id="s-coowners" style="color:#a29bfe">—</div><div class="lbl">Co-Owner</div></div>
   </div>
 
   <!-- Toolbar -->
@@ -211,6 +213,8 @@
       <option value="banned">Chỉ bị cấm</option>
       <option value="griefer">Chỉ griefer</option>
       <option value="atrisk">Nguy hiểm &lt;50₫</option>
+      <option value="admin">Chỉ Admin</option>
+      <option value="co-owner">Chỉ Co-Owner</option>
     </select>
 
     <button onclick="loadPlayers();loadStats()">🔄 Làm mới</button>
@@ -227,6 +231,7 @@
           <th onclick="toggleSort('kickCount')"  >Bị kick <span class="sort-arrow" id="arrow-kickCount"></span></th>
           <th onclick="toggleSort('voteCount')"  >Vote <span class="sort-arrow" id="arrow-voteCount"></span></th>
           <th>Trạng thái</th>
+          <th>Vai trò</th>
           <th onclick="toggleSort('lastSeen')"   >Lần cuối <span class="sort-arrow" id="arrow-lastSeen"></span></th>
           <th>UUID</th>
           <th>Hành động</th>
@@ -273,6 +278,25 @@
     <div class="modal-btns">
       <button onclick="closeKickModal()">Hủy</button>
       <button class="danger" onclick="submitKick()">Kick</button>
+    </div>
+  </div>
+</div>
+
+<!-- Role modal -->
+<div class="modal-bg" id="role-modal">
+  <div class="modal">
+    <h2>👑 Đổi vai trò</h2>
+    <p style="color:var(--muted);font-size:.85rem">Người chơi: <span id="role-modal-name" style="color:var(--text)"></span></p>
+    <label>Vai trò mới</label>
+    <select id="role-select" style="width:100%;margin-top:4px">
+      <option value="player">👤 Player</option>
+      <option value="admin">🔰 Admin</option>
+      <option value="co-owner">💎 Co-Owner</option>
+    </select>
+    <p style="color:var(--muted);font-size:.78rem;margin-top:8px">⚡ Áp dụng ngay lập tức lên server.</p>
+    <div class="modal-btns">
+      <button onclick="closeRoleModal()">Hủy</button>
+      <button class="primary" onclick="submitRole()">Lưu</button>
     </div>
   </div>
 </div>
@@ -360,6 +384,8 @@ async function loadStats() {
     document.getElementById('s-atrisk').textContent  = d.atRisk || 0;
     document.getElementById('s-banned').textContent  = d.banned || 0;
     document.getElementById('s-griefer').textContent = d.griefer || 0;
+    document.getElementById('s-admins').textContent  = d.admins  ?? '—';
+    document.getElementById('s-coowners').textContent = d.coOwners ?? '—';
     document.getElementById('live-dot').style.background = 'var(--ok)';
     document.getElementById('live-dot').style.boxShadow  = '0 0 6px var(--ok)';
   } catch (e) {
@@ -385,6 +411,9 @@ async function loadPlayers(showLoading = true) {
 
   let url = `${API}/api/players?page=${page}&limit=30&sort=${sortField}&order=${sortOrder}`;
   if (search)       url += `&search=${encodeURIComponent(search)}`;
+  if (filterStatus === 'admin') url += '&role=admin';
+  else if (filterStatus === 'co-owner') url += '&role=co-owner';
+  else if (filterStatus) url += `&status=${filterStatus}`;
 
   try {
     const r = await fetch(url);
@@ -422,6 +451,8 @@ function renderTable(players) {
     const bar = barColor(p.score);
     const pct = Math.max(0, Math.min(100, p.score));
     const tags = statusTags(p);
+    // Role display
+    const roleHtml = roleTag(p.role);
     const ago  = relativeTime(p.lastSeen);
     const shortUuid = p.uuid ? p.uuid.substring(0, 12) + '…' : '—';
 
@@ -440,6 +471,7 @@ function renderTable(players) {
       <td style="color:var(--danger)">${p.kickCount || 0}</td>
       <td style="color:var(--warn)">${p.voteCount || 0}</td>
       <td>${tags}</td>
+      <td>${roleHtml}</td>
       <td style="color:var(--muted);font-size:.78rem">${ago}</td>
       <td class="uuid-cell" title="${p.uuid}">${shortUuid}</td>
       <td>
@@ -452,6 +484,7 @@ function renderTable(players) {
           ${p.griefer
             ? `<button onclick="setGriefer('${p._id}',false)">🔓 Tha Grief</button>`
             : `<button onclick="setGriefer('${p._id}',true)" style="color:var(--purple)">🚨 Grief</button>`}
+          ${p.role !== 'owner' ? `<button onclick="openRoleModal('${p._id}','${escHtml(p.lastName)}','${p.role||'player'}')" title="Đổi vai trò" style="color:var(--purple)">👑 Vai trò</button>` : ''}
         </div>
       </td>
     </tr>`;
@@ -518,6 +551,7 @@ async function showDetail(id) {
         <div class="detail-row"><span class="key">Điểm</span><span class="score-badge ${scoreClass(p.score)}">${p.score}₫</span></div>
         <div class="detail-row"><span class="key">Bị cấm</span><span style="color:${p.banned?'var(--danger)':'var(--ok)'}">${p.banned?'⛔ Có':'✅ Không'}</span></div>
         <div class="detail-row"><span class="key">Griefer</span><span style="color:${p.griefer?'var(--purple)':'var(--ok)'}">${p.griefer?'🚨 Có':'✅ Không'}</span></div>
+        <div class="detail-row"><span class="key">Vai trò</span><span>${roleTag(p.role)}</span></div>
         <div class="detail-row"><span class="key">Server</span><span>${escHtml(p.serverName) || '—'}</span></div>
         <div class="detail-row"><span class="key">Lần cuối</span><span>${relativeTime(p.lastSeen)}</span></div>
       </div>
@@ -584,6 +618,27 @@ async function submitKick() {
   loadPlayers(false); loadStats();
 }
 
+// ── Role modal ────────────────────────────────────────
+function openRoleModal(uuid, name, currentRole) {
+  currentModalUuid = uuid;
+  document.getElementById('role-modal-name').textContent = name;
+  document.getElementById('role-select').value = currentRole || 'player';
+  document.getElementById('role-modal').classList.add('active');
+}
+function closeRoleModal() {
+  document.getElementById('role-modal').classList.remove('active');
+  currentModalUuid = null;
+}
+async function submitRole() {
+  const role = document.getElementById('role-select').value;
+  await api(`/api/players/${currentModalUuid}/role`, 'POST', { role });
+  closeRoleModal();
+  toast('👑 Đã cập nhật vai trò — áp dụng ngay!', 'ok');
+  loadPlayers(false); loadStats();
+}
+
+
+
 // ── Actions ───────────────────────────────────────────
 async function ban(uuid) {
   if (!confirm('Cấm người chơi này? Sẽ áp dụng ngay lập tức.')) return;
@@ -644,6 +699,15 @@ function barColor(s) {
   if (s >= 30) return 'var(--warn)';
   return 'var(--danger)';
 }
+function roleTag(role) {
+  switch(role) {
+    case 'owner':    return '<span class="tag" style="background:#ff475722;color:#ff4757;border:1px solid #ff4757">👑 Owner</span>';
+    case 'co-owner': return '<span class="tag" style="background:#a29bfe22;color:#a29bfe;border:1px solid #a29bfe">💎 Co-Owner</span>';
+    case 'admin':    return '<span class="tag" style="background:#74b9ff22;color:#74b9ff;border:1px solid #74b9ff">🔰 Admin</span>';
+    default:         return '<span class="tag" style="background:#2ed57322;color:#2ed573;border:1px solid #2ed573">👤 Player</span>';
+  }
+}
+
 function statusTags(p) {
   let t = '';
   if (p.banned)  t += `<span class="tag tag-ban">⛔ BAN</span>`;
@@ -668,12 +732,12 @@ function escHtml(s) {
 
 // ── Close modal on bg click ───────────────────────────
 document.querySelectorAll('.modal-bg').forEach(el => {
-  el.addEventListener('click', e => { if (e.target === el) { closeScoreModal(); closeKickModal(); } });
+  el.addEventListener('click', e => { if (e.target === el) { closeScoreModal(); closeKickModal(); closeRoleModal(); } });
 });
 
 // ── Keyboard shortcuts ────────────────────────────────
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { closeDetail(); closeScoreModal(); closeKickModal(); }
+  if (e.key === 'Escape') { closeDetail(); closeScoreModal(); closeKickModal(); closeRoleModal(); }
   if (e.key === 'Enter') {
     if (document.getElementById('score-modal').classList.contains('active')) submitScore();
     if (document.getElementById('kick-modal').classList.contains('active'))  submitKick();
